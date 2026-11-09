@@ -855,6 +855,7 @@
       case 'board_archived': return 'arquivou o quadro';
       case 'board_restored': return 'restaurou o quadro';
       case 'board_deleted': return `excluiu o quadro ${T(d.title)}`;
+      case 'board_imported': return `importou este quadro do ${esc(d.source || 'Trello')} (${d.lists || 0} listas, ${d.cards || 0} cartões, ${d.items || 0} itens de checklist, ${d.comments || 0} comentários)`;
       case 'member_added': return `adicionou ${T(d.name)} ao quadro como ${role(d.role)}`;
       case 'member_role': return `alterou o papel de ${T(d.name)} para ${role(d.to)}`;
       case 'member_removed': return `removeu ${T(d.name)} do quadro`;
@@ -1259,6 +1260,10 @@
           </table></div>
           <p class="small muted" style="line-height:1.5;margin-bottom:0">Desativar bloqueia o acesso imediatamente, mas preserva o histórico do servidor. Administradores enxergam e gerenciam todos os quadros.</p>
         </section>
+        <section class="panel" style="margin-bottom:20px">
+          <h2>${icon('board')} Importar do Trello</h2>
+          ${renderImport()}
+        </section>
         <section class="panel">
           <h2>${icon('settings')} Regras de cadastro</h2>
           <form data-submit="admin-config" style="max-width:480px">
@@ -1269,6 +1274,157 @@
           </form>
         </section>
       </main>`;
+  }
+
+  // ------------------------------------------------------------------------
+  // Importação do Trello
+  // ------------------------------------------------------------------------
+  const TRELLO_LABEL_COLORS = {
+    green: '#2e8b57', yellow: '#d4a72c', orange: '#e2711d', red: '#c9372c', purple: '#7a4fa3',
+    blue: '#2f6f9f', sky: '#0e8fb0', lime: '#65a30d', pink: '#db2777', black: '#475569'
+  };
+  const TRELLO_BOARD_COLORS = {
+    blue: '#1f6fb5', orange: '#c0632b', green: '#2e8b57', red: '#b23a48', purple: '#7a4fa3',
+    pink: '#b23a48', lime: '#2e8b57', sky: '#0f766e', grey: '#475569'
+  };
+  const normName = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const trelloIdDate = (id) => { const t = parseInt(String(id || '').slice(0, 8), 16); return t ? new Date(t * 1000).toISOString() : null; };
+  const isoToLocalDate = (iso) => { if (!iso) return null; const d = new Date(iso); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
+  const fmtDateTimeBR = (iso) => { const d = new Date(iso); return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+
+  function trelloMembers(t) {
+    const byId = Object.fromEntries((t.members || []).map((m) => [m.id, m]));
+    const used = uniq((t.cards || []).flatMap((c) => c.idMembers || []));
+    return used.map((id) => ({ id, name: (byId[id] && (byId[id].fullName || byId[id].username)) || 'Membro do Trello' }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  function trelloSummary(t) {
+    const lists = t.lists || [], cards = t.cards || [];
+    const comments = (t.actions || []).filter((a) => a.type === 'commentCard').length;
+    const items = (t.checklists || []).reduce((n, c) => n + (c.checkItems || []).filter((i) => String(i.name || '').trim()).length, 0);
+    return {
+      lists: lists.length, listsArch: lists.filter((l) => l.closed).length,
+      cards: cards.length, cardsArch: cards.filter((c) => c.closed).length,
+      labels: (t.labels || []).length, checklists: (t.checklists || []).length, items, comments,
+      actionsCapped: (t.actions || []).length >= 1000
+    };
+  }
+
+  function buildTrelloPayload(t, opts) {
+    const map = opts.map || {};
+    const memberName = Object.fromEntries(trelloMembers(t).map((m) => [m.id, m.name]));
+    const lists = (t.lists || []).filter((l) => opts.includeArchived || !l.closed)
+      .sort((a, b) => (a.pos || 0) - (b.pos || 0))
+      .map((l, i) => ({ key: l.id, title: l.name, position: (i + 1) * 1000, archived: !!l.closed }));
+    const listKeys = new Set(lists.map((l) => l.key));
+
+    const labels = (t.labels || []).map((l) => ({
+      key: l.id, name: l.name || '',
+      color: TRELLO_LABEL_COLORS[String(l.color || '').replace(/_(light|dark)$/, '')] || '#64748b'
+    }));
+
+    const checklistsByCard = {};
+    (t.checklists || []).slice().sort((a, b) => (a.pos || 0) - (b.pos || 0)).forEach((cl) => {
+      (checklistsByCard[cl.idCard] = checklistsByCard[cl.idCard] || []).push({
+        title: cl.name,
+        items: (cl.checkItems || []).slice().sort((a, b) => (a.pos || 0) - (b.pos || 0))
+          .map((it) => ({ text: it.name, done: it.state === 'complete' }))
+      });
+    });
+
+    const commentsByCard = {};
+    if (opts.includeComments) {
+      (t.actions || []).filter((a) => a.type === 'commentCard' && a.data && a.data.card && a.data.text)
+        .sort((a, b) => new Date(a.date) - new Date(b.date))
+        .forEach((a) => {
+          const who = (a.memberCreator && (a.memberCreator.fullName || a.memberCreator.username)) || 'Membro do Trello';
+          (commentsByCard[a.data.card.id] = commentsByCard[a.data.card.id] || [])
+            .push({ body: `Comentário de ${who} no Trello em ${fmtDateTimeBR(a.date)}:\n\n${a.data.text}` });
+        });
+    }
+
+    const byList = {};
+    (t.cards || []).filter((c) => listKeys.has(c.idList) && (opts.includeArchived || !c.closed))
+      .forEach((c) => (byList[c.idList] = byList[c.idList] || []).push(c));
+
+    const cards = [];
+    const usedMembers = new Set();
+    Object.values(byList).forEach((arr) => {
+      arr.sort((a, b) => (a.pos || 0) - (b.pos || 0)).forEach((c, i) => {
+        const ids = c.idMembers || [];
+        const assignees = ids.filter((id) => map[id]).map((id) => map[id]);
+        assignees.forEach((u) => usedMembers.add(u));
+        const notes = ids.filter((id) => !map[id]).map((id) => memberName[id] || 'Membro do Trello');
+        const parts = [];
+        if (c.desc && c.desc.trim()) parts.push(c.desc.trim());
+        if (notes.length) parts.push(`Responsáveis no Trello: ${notes.join(', ')}`);
+        const att = (c.attachments || []).filter((a) => a.url);
+        if (att.length) parts.push('Anexos no Trello:\n' + att.map((a) => `- ${a.name || 'arquivo'}: ${a.url}`).join('\n'));
+        cards.push({
+          key: c.id, list: c.idList, title: String(c.name || '').slice(0, 300),
+          description: parts.join('\n\n'),
+          position: (i + 1) * 1000,
+          start_date: isoToLocalDate(c.start),
+          due_date: c.due || null,
+          completed: !!c.dueComplete,
+          archived: !!c.closed,
+          created_at: trelloIdDate(c.id),
+          labels: c.idLabels || [],
+          assignees,
+          checklists: checklistsByCard[c.id] || [],
+          comments: commentsByCard[c.id] || []
+        });
+      });
+    });
+
+    const bg = t.prefs || {};
+    const color = /^#[0-9a-f]{6}$/i.test(bg.backgroundColor || '') ? bg.backgroundColor : (TRELLO_BOARD_COLORS[bg.background] || '#1f6fb5');
+    return {
+      title: opts.title || t.name || 'Quadro importado',
+      description: (t.desc || '').slice(0, 300),
+      color, members: [...usedMembers], lists, labels, cards
+    };
+  }
+
+  function renderImport() {
+    const imp = S.imp;
+    const intro = `
+      <p class="small muted" style="line-height:1.6;margin-top:0">No Trello, abra o quadro e vá em <b>Menu (···) &gt; Imprimir, exportar e compartilhar &gt; Exportar como JSON</b>.
+      Salve o arquivo e selecione-o abaixo. Importe um quadro por vez; cada importação cria um quadro novo, sem alterar os existentes.</p>
+      <label class="btn">${icon('download', 14)} Escolher arquivo JSON<input type="file" accept=".json,application/json" data-change="trello-file" style="display:none"></label>`;
+    if (!imp) return intro;
+    const s = imp.summary;
+    const profiles = Object.values(S.profiles).filter((p) => p.status === 'active').sort((a, b) => a.full_name.localeCompare(b.full_name));
+    return `
+      ${intro} <span class="small muted" style="margin-left:6px">${esc(imp.fileName)}</span>
+      <form data-submit="import-trello" style="margin-top:18px;max-width:640px">
+        <label class="field"><span>Nome do quadro no sistema</span><input class="input" name="title" value="${esc(imp.data.name || '')}" maxlength="80" required></label>
+        <div class="notice">
+          Encontrado no arquivo: <b>${s.lists}</b> listas${s.listsArch ? ` (${s.listsArch} arquivadas)` : ''},
+          <b>${s.cards}</b> cartões${s.cardsArch ? ` (${s.cardsArch} arquivados)` : ''},
+          <b>${s.labels}</b> etiquetas, <b>${s.checklists}</b> checklists com <b>${s.items}</b> itens e
+          <b>${s.comments}</b> comentários.
+          ${s.actionsCapped ? '<br>O Trello inclui no arquivo apenas as ações mais recentes, então comentários muito antigos podem não vir.' : ''}
+        </div>
+        <label class="row" style="margin-bottom:8px;cursor:pointer"><input type="checkbox" name="archived" checked> Importar também listas e cartões arquivados (entram como arquivados)</label>
+        <label class="row" style="margin-bottom:16px;cursor:pointer"><input type="checkbox" name="comments" checked> Importar comentários (entram com o nome do autor e a data original no texto)</label>
+        ${imp.members.length ? `
+          <h4 style="margin:8px 0 4px;font-size:14px">Responsáveis do Trello</h4>
+          <p class="small muted" style="margin:0 0 8px;line-height:1.5">Quem ainda não tem conta fica anotado na descrição do cartão. Se a pessoa já estiver cadastrada, escolha o servidor para que ela vire responsável de verdade.</p>
+          <div class="table-wrap"><table class="table"><tbody>
+            ${imp.members.map((m) => `
+              <tr><td style="width:45%">${esc(m.name)}</td><td>
+                <select class="select" name="map_${esc(m.id)}">
+                  <option value="">Anotar no cartão</option>
+                  ${profiles.map((p) => `<option value="${p.id}" ${imp.guess[m.id] === p.id ? 'selected' : ''}>${esc(p.full_name)}</option>`).join('')}
+                </select></td></tr>`).join('')}
+          </tbody></table></div>` : ''}
+        <div class="row" style="margin-top:16px">
+          <button class="btn primary" type="submit">Importar quadro</button>
+          <button class="btn" type="button" data-act="cancel-import">Cancelar</button>
+        </div>
+      </form>`;
   }
 
   // ------------------------------------------------------------------------
@@ -1518,6 +1674,7 @@
     },
 
     // administração
+    'cancel-import': () => { S.imp = null; renderAdmin(); },
     'user-status': async (el) => {
       const st = el.dataset.status;
       const u = S.profiles[el.dataset.id];
@@ -1702,6 +1859,29 @@
       await q(sb.from('cards').update({ list_id: listId, position }).eq('id', S.cd.card.id));
       await afterCardChange();
     },
+    'import-trello': async (f) => {
+      const imp = S.imp;
+      const map = {};
+      imp.members.forEach((m) => { const v = f.elements['map_' + m.id] && f.elements['map_' + m.id].value; if (v) map[m.id] = v; });
+      const payload = buildTrelloPayload(imp.data, {
+        title: f.title.value.trim(), includeArchived: f.archived.checked, includeComments: f.comments.checked, map
+      });
+      if (!payload.cards.length && !payload.lists.length) return toast('Nada para importar neste arquivo.', true);
+      const btn = f.querySelector('[type=submit]');
+      btn.disabled = true; btn.textContent = 'Importando...';
+      try {
+        const boardId = await q(sb.rpc('import_board', { payload }));
+        S.imp = null;
+        toast(`Quadro importado: ${payload.cards.length} cartões.`);
+        go(`#/b/${boardId}`);
+      } catch (e) {
+        btn.disabled = false; btn.textContent = 'Importar quadro';
+        if (/import_board/.test(e.message || '') && /function|schema cache/i.test(e.message || '')) {
+          throw new Error('A função de importação ainda não existe no banco. Execute o arquivo atualizacao-01-importar-trello.sql no SQL Editor do Supabase.');
+        }
+        throw e;
+      }
+    },
     'admin-config': async (f) => {
       const dom = f.allowed_domain.value.trim().replace(/^@/, '').toLowerCase() || null;
       await q(sb.from('app_config').update({ allowed_domain: dom, require_approval: f.require_approval.checked, updated_at: new Date().toISOString() }).eq('id', 1));
@@ -1742,6 +1922,20 @@
       if (it) { it.done = el.checked; renderCardModal(); }
       await q(sb.from('checklist_items').update({ done: el.checked }).eq('id', el.dataset.id));
       await afterCardChange();
+    },
+    'trello-file': async (el) => {
+      const file = el.files && el.files[0];
+      if (!file) return;
+      let data;
+      try { data = JSON.parse(await file.text()); } catch (e) { throw new Error('Não foi possível ler o arquivo. Confirme que é o JSON exportado do Trello.'); }
+      if (!data || !Array.isArray(data.lists) || !Array.isArray(data.cards)) {
+        throw new Error('Este arquivo não parece ser a exportação JSON de um quadro do Trello.');
+      }
+      const members = trelloMembers(data);
+      const byName = Object.fromEntries(Object.values(S.profiles).filter((p) => p.status === 'active').map((p) => [normName(p.full_name), p.id]));
+      const guess = Object.fromEntries(members.map((m) => [m.id, byName[normName(m.name)] || '']));
+      S.imp = { data, fileName: file.name, summary: trelloSummary(data), members, guess };
+      renderAdmin();
     },
     'admin-toggle': async (el) => {
       try {
