@@ -314,3 +314,19 @@ a { color: var(--primary); }
 
 .filters .btn { background: #ffffff33; color: #fff; }
 .filters .btn:hover { background: #ffffff4d; }
+
+/* ---------- Anexos ---------- */
+.att { display: flex; gap: 12px; align-items: flex-start; padding: 6px; border-radius: 8px; }
+.att:hover { background: var(--bg); }
+.att-thumb { width: 88px; height: 64px; flex: none; border-radius: 6px; border: 0; padding: 0; background: #091e420f; display: grid; place-items: center; overflow: hidden; cursor: pointer; color: var(--ink-2); font-weight: 700; font-size: 13px; }
+.att-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.att-info { flex: 1; min-width: 0; padding-top: 2px; }
+.att-name { border: 0; background: none; padding: 0; font-weight: 600; text-align: left; cursor: pointer; color: var(--ink); overflow-wrap: anywhere; }
+.att-name:hover { text-decoration: underline; }
+.att-acts { margin-top: 4px; font-size: 12px; }
+.att-acts button { border: 0; background: none; padding: 0; color: var(--ink-3); text-decoration: underline; cursor: pointer; margin-right: 10px; }
+.att.uploading { opacity: .75; }
+.spin { width: 20px; height: 20px; border-radius: 50%; border: 3px solid #091e4224; border-top-color: var(--primary); animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.modal.dropping { box-shadow: 0 0 0 4px var(--primary), var(--shadow-pop); }
+.modal.dropping::after { content: "Solte os arquivos para anexar"; position: absolute; inset: 0; display: grid; place-items: center; background: #e9f2ffe6; color: #0c4a8a; font-weight: 700; font-size: 18px; border-radius: 12px; pointer-events: none; z-index: 5; }
