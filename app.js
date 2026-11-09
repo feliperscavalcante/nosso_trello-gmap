@@ -62,18 +62,21 @@
       [/row-level security|permission denied|violates row-level/i, 'Você não tem permissão para esta ação.'],
       [/rate limit|too many/i, 'Muitas tentativas seguidas. Aguarde alguns minutos.'],
       [/Failed to fetch|NetworkError/i, 'Sem conexão com o servidor. Verifique sua internet.'],
-      [/JWT expired/i, 'Sua sessão expirou. Entre novamente.']
+      [/JWT expired/i, 'Sua sessão expirou. Entre novamente.'],
+      [/Bucket not found/i, 'O armazenamento de anexos ainda não foi ativado. Execute o arquivo atualizacao-02-anexos.sql no Supabase.'],
+      [/mime type .* is not supported|invalid mime/i, 'Tipo de arquivo não permitido.'],
+      [/exceeded the maximum allowed size|Payload too large/i, 'O arquivo passa do limite de 10 MB.']
     ];
     for (const [re, txt] of map) if (re.test(m)) return txt;
     return m;
   }
 
-  function toast(msg, err = false) {
+  function toast(msg, err = false, ms = 0) {
     const el = document.createElement('div');
     el.className = 'toast' + (err ? ' err' : '');
     el.textContent = msg;
     $('#toast-root').appendChild(el);
-    setTimeout(() => el.remove(), err ? 5000 : 2800);
+    setTimeout(() => el.remove(), ms || (err ? 5000 : 2800));
   }
 
   function initials(name) {
@@ -152,7 +155,8 @@
     board: '<rect x="3" y="4" width="7" height="16" rx="1.5"/><rect x="14" y="4" width="7" height="10" rx="1.5"/>',
     calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
     eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
-    key: '<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M17 6l3 3"/>'
+    key: '<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M17 6l3 3"/>',
+    clip: '<path d="M21 11.5 12.5 20a5 5 0 0 1-7-7l9-9a3.5 3.5 0 0 1 5 5l-9 9a2 2 0 0 1-3-3l8-8"/>'
   };
   const icon = (n, s = 16) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[n] || ''}</svg>`;
 
@@ -608,6 +612,7 @@
     else if (c.completed) badges.push(`<span class="badge ok">${icon('checksq', 13)} Concluído</span>`);
     if (c.description) badges.push(`<span class="badge" title="Possui descrição">${icon('desc', 13)}</span>`);
     if (s.comments) badges.push(`<span class="badge" title="Comentários">${icon('comment', 13)} ${s.comments}</span>`);
+    if (s.attachments) badges.push(`<span class="badge" title="Anexos">${icon('clip', 13)} ${s.attachments}</span>`);
     if (s.items_total) badges.push(`<span class="badge ${s.items_done === s.items_total ? 'ok' : ''}" title="Checklist">${icon('checksq', 13)} ${s.items_done}/${s.items_total}</span>`);
     return `
       <div class="card ${c.completed ? 'done' : ''}" data-card="${c.id}" data-act="open-card" data-id="${c.id}">
@@ -891,6 +896,8 @@
       case 'comment_added': return `comentou${on}: "${esc(d.text)}"`;
       case 'comment_edited': return `editou um comentário${on}`;
       case 'comment_deleted': return `excluiu um comentário${on}`;
+      case 'attachment_added': return `anexou ${T(d.name)}${on}`;
+      case 'attachment_removed': return `removeu o anexo ${T(d.name)}${on}`;
       default: return esc(a.action);
     }
   }
@@ -909,7 +916,7 @@
   // ------------------------------------------------------------------------
   async function openCard(id) {
     S.openCard = id;
-    S.cd = { card: null, checklists: [], items: [], comments: [], activity: [], showDetails: true, editingDesc: false, editingComment: null, addingItemTo: null, editingItem: null, renamingChecklist: null };
+    S.cd = { card: null, checklists: [], items: [], comments: [], activity: [], showDetails: true, editingDesc: false, editingComment: null, addingItemTo: null, editingItem: null, renamingChecklist: null, attachments: [], uploading: [], attUnavailable: false };
     try {
       const ok = await reloadCard();
       if (!ok) { toast('Cartão não encontrado.', true); S.openCard = null; S.cd = null; return go(`#/b/${S.board.id}`); }
@@ -919,16 +926,23 @@
   async function reloadCard() {
     if (!S.cd) return false;
     const id = S.openCard;
-    const [card, checklists, items, comments, activity] = await Promise.all([
+    const [card, checklists, items, comments, activity, attachments] = await Promise.all([
       q(sb.from('cards').select('*').eq('id', id).maybeSingle()),
       q(sb.from('checklists').select('*').eq('card_id', id).order('position').order('created_at')),
       q(sb.from('checklist_items').select('*').eq('card_id', id).order('position').order('created_at')),
       q(sb.from('comments').select('*').eq('card_id', id).order('created_at', { ascending: false })),
-      q(sb.from('activity').select('*').eq('card_id', id).order('created_at', { ascending: false }).limit(150))
-    ]);
+      q(sb.from('activity').select('*').eq('card_id', id).order('created_at', { ascending: false }).limit(150)),
+      sb.from('attachments').select('*').eq('card_id', id).order('created_at', { ascending: false })
+    ]).then(async (r) => {
+      const att = r.pop();
+      if (S.cd) S.cd.attUnavailable = !!att.error;
+      const list = att.error ? [] : att.data;
+      await signThumbs(list);
+      return [...r, list];
+    });
     if (!S.cd || S.openCard !== id) return true;
     if (!card || card.board_id !== S.board.id) return false;
-    Object.assign(S.cd, { card, checklists, items, comments, activity });
+    Object.assign(S.cd, { card, checklists, items, comments, activity, attachments });
     const i = S.cards.findIndex((c) => c.id === id);
     if (i >= 0) S.cards[i] = card;
     renderCardModal();
@@ -1022,6 +1036,7 @@
       <button class="btn block" data-act="pop-labels">${icon('tag')} Etiquetas</button>
       <button class="btn block" data-act="pop-checklist">${icon('checksq')} Checklist</button>
       <button class="btn block" data-act="pop-dates">${icon('calendar')} Datas</button>
+      ${S.cd.attUnavailable ? '' : `<button class="btn block" data-act="pick-files">${icon('clip')} Anexo</button>`}
       <h5 style="margin-top:16px">Ações</h5>
       <button class="btn block" data-act="pop-move">${icon('move')} Mover</button>
       <button class="btn block" data-act="copy-link">${icon('link')} Copiar link</button>
@@ -1046,6 +1061,7 @@
           <div>
             ${meta.length ? `<div class="meta-row">${meta.join('')}</div>` : ''}
             <div class="cm-section"><h4>${icon('desc')} Descrição ${ed && c.description && !cd.editingDesc ? '<button class="btn sm" data-act="edit-desc" style="margin-left:auto">Editar</button>' : ''}</h4>${desc}</div>
+            ${renderAttachments(ed)}
             ${checklists}
             <div class="cm-section">
               <h4>${icon('comment')} Comentários e atividade
@@ -1226,8 +1242,26 @@
     await loadMe();
     const cfg = await q(sb.from('app_config').select('*').eq('id', 1).maybeSingle());
     const boards = await q(sb.from('boards').select('id,title,archived'));
-    S.admin = { cfg: cfg || {}, boards };
+    const us = await sb.rpc('attachments_usage');
+    const usage = us.error ? null : (Array.isArray(us.data) ? us.data[0] : us.data);
+    S.admin = { cfg: cfg || {}, boards, usage };
     renderAdmin();
+  }
+
+  function renderUsage() {
+    const u = S.admin.usage;
+    if (!u) {
+      return `<div class="notice">Os anexos ainda não foram ativados. Execute o arquivo <b>atualizacao-02-anexos.sql</b> no SQL Editor do Supabase.</div>`;
+    }
+    const pct = Math.min(100, (Number(u.total_bytes) / STORAGE_QUOTA) * 100);
+    const level = pct >= 90 ? 'var(--danger)' : pct >= 75 ? '#d4a72c' : 'var(--primary)';
+    return `
+      <section class="panel" style="margin-bottom:20px">
+        <h2>${icon('clip')} Espaço dos anexos</h2>
+        <div class="progress" style="font-size:13px;margin-bottom:6px"><div class="bar" style="height:10px"><i style="width:${Math.max(pct, 0.5).toFixed(1)}%;background:${level}"></i></div><span><b>${pct.toFixed(1).replace('.', ',')}%</b></span></div>
+        <p class="small muted" style="margin:0;line-height:1.5">${fmtSize(Number(u.total_bytes))} usados de 1 GB, em ${u.files} arquivo(s). Limite do plano gratuito do Supabase.
+        ${pct >= 75 ? ' <b style="color:var(--danger)">O espaço está acabando: exclua anexos antigos de quadros arquivados ou avalie o plano pago.</b>' : ''}</p>
+      </section>`;
   }
 
   function renderAdmin() {
@@ -1241,6 +1275,7 @@
       <main class="page">
         <h2 style="font-size:20px">${icon('shield', 20)} Administração</h2>
         ${pend ? `<div class="notice">Há <b>${pend}</b> cadastro(s) aguardando aprovação.</div>` : ''}
+        ${renderUsage()}
         <section class="panel" style="margin-bottom:20px">
           <h2>${icon('users')} Usuários (${users.length})</h2>
           <div class="table-wrap"><table class="table">
@@ -1428,6 +1463,149 @@
   }
 
   // ------------------------------------------------------------------------
+  // Anexos
+  // ------------------------------------------------------------------------
+  const ATT_MAX = 10 * 1024 * 1024;
+  const STORAGE_QUOTA = 1024 * 1024 * 1024;
+  const ATT_TYPES = {
+    pdf: 'application/pdf',
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', heic: 'image/heic', heif: 'image/heif',
+    doc: 'application/msword', docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    xls: 'application/vnd.ms-excel', xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    zip: 'application/zip', rar: 'application/vnd.rar', '7z': 'application/x-7z-compressed'
+  };
+  const ATT_ACCEPT = Object.keys(ATT_TYPES).map((e) => '.' + e).join(',');
+  const extOf = (n) => (String(n || '').includes('.') ? String(n).split('.').pop().toLowerCase() : '');
+  const fmtSize = (b) => (b < 1024 ? `${b} B` : b < 1048576 ? `${Math.round(b / 1024)} KB` : `${(b / 1048576).toFixed(1).replace('.', ',')} MB`);
+  const safeFileName = (n) => (String(n).normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^\w.-]+/g, '_').replace(/_+/g, '_').slice(-80) || 'arquivo');
+  const isPreviewable = (a) => /^(application\/pdf|image\/(jpeg|png|gif|webp))$/.test(a.mime_type || '');
+  const isImage = (a) => /^image\/(jpeg|png|gif|webp)$/.test(a.mime_type || '');
+  const thumbCache = {};
+  const bucket = () => sb.storage.from('anexos');
+
+  // Reduz fotos grandes (lado maior até 1920 px, JPEG) antes do envio
+  async function shrinkImage(file) {
+    if (!/^image\/(jpeg|png|webp)$/.test(file.type) || file.size < 600 * 1024 || !window.createImageBitmap) return null;
+    let bmp;
+    try { bmp = await createImageBitmap(file, { imageOrientation: 'from-image' }); } catch (e) { return null; }
+    const scale = Math.min(1, 1920 / Math.max(bmp.width, bmp.height));
+    const w = Math.round(bmp.width * scale), h = Math.round(bmp.height * scale);
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(bmp, 0, 0, w, h);
+    if (bmp.close) bmp.close();
+    const blob = await new Promise((r) => canvas.toBlob(r, 'image/jpeg', 0.82));
+    if (!blob || blob.size >= file.size * 0.9) return null;
+    return { blob, name: file.name.replace(/\.(png|webp|jpe?g)$/i, '') + '.jpg', type: 'image/jpeg' };
+  }
+
+  async function uploadFiles(fileList) {
+    if (!S.cd || !canEdit() || S.board.archived) return;
+    const cardId = S.cd.card.id;
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    let sent = 0;
+    for (const f of files) {
+      const fname = f.name && f.name !== 'image.png' ? f.name : `print-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-')}.png`;
+      let type = ATT_TYPES[extOf(fname)];
+      if (!type) {
+        toast(`"${fname}" não foi enviado: tipo de arquivo não permitido. Aceitos: PDF, imagens, Word, Excel e compactados (ZIP, RAR, 7Z).`, true, 7000);
+        continue;
+      }
+      let blob = f, name = fname, note = null;
+      const small = await shrinkImage(f).catch(() => null);
+      if (small) {
+        blob = small.blob; name = small.name; type = small.type;
+        note = `A imagem "${fname}" foi reduzida de ${fmtSize(f.size)} para ${fmtSize(blob.size)} antes do envio. Motivo: o sistema usa o armazenamento gratuito do Supabase (1 GB para todo o setor) e fotos de celular ocupam muito espaço. A imagem continua nítida para leitura.`;
+      }
+      if (blob.size > ATT_MAX) { toast(`"${fname}" tem ${fmtSize(blob.size)} e passa do limite de 10 MB por arquivo.`, true, 7000); continue; }
+      if (!S.cd || S.cd.card.id !== cardId) return;
+      S.cd.uploading.push(name);
+      renderCardModal();
+      const path = `${S.board.id}/${cardId}/${crypto.randomUUID()}-${safeFileName(name)}`;
+      try {
+        const { error } = await bucket().upload(path, new Blob([blob], { type }), { contentType: type, upsert: false });
+        if (error) throw error;
+        try {
+          await q(sb.from('attachments').insert({ card_id: cardId, file_name: name, storage_path: path, mime_type: type, size_bytes: blob.size, uploaded_by: S.me.id }));
+        } catch (e) { await bucket().remove([path]); throw e; }
+        sent++;
+        if (note) toast(note, false, 10000);
+      } catch (e) {
+        toast(`Falha ao enviar "${name}": ${errMsg(e)}`, true, 7000);
+      } finally {
+        if (S.cd) S.cd.uploading = S.cd.uploading.filter((x) => x !== name);
+      }
+    }
+    if (sent) toast(sent === 1 ? 'Anexo enviado.' : `${sent} anexos enviados.`);
+    await afterCardChange();
+  }
+
+  async function signThumbs(atts) {
+    const now = Date.now();
+    const need = atts.filter((a) => isImage(a) && !(thumbCache[a.storage_path] && thumbCache[a.storage_path].exp > now));
+    if (!need.length) return;
+    try {
+      const { data } = await bucket().createSignedUrls(need.map((a) => a.storage_path), 3600);
+      (data || []).forEach((d) => { if (d.signedUrl) thumbCache[d.path] = { url: d.signedUrl, exp: now + 50 * 60 * 1000 }; });
+    } catch (e) { /* miniaturas são opcionais */ }
+  }
+
+  async function attachmentPaths(filter) {
+    const out = [];
+    for (let from = 0; ; from += 1000) {
+      let qb = sb.from('attachments').select('storage_path');
+      Object.entries(filter).forEach(([k, v]) => { qb = Array.isArray(v) ? qb.in(k, v) : qb.eq(k, v); });
+      const { data, error } = await qb.range(from, from + 999);
+      if (error) return out; // atualização de anexos ainda não aplicada
+      out.push(...data.map((r) => r.storage_path));
+      if (data.length < 1000) return out;
+    }
+  }
+  async function removeStoredFiles(paths) {
+    for (let i = 0; i < paths.length; i += 100) {
+      const { error } = await bucket().remove(paths.slice(i, i + 100));
+      if (error) throw error;
+    }
+  }
+
+  function renderAttachments(ed) {
+    const cd = S.cd;
+    if (cd.attUnavailable) {
+      return ed ? `<div class="cm-section"><h4>${icon('clip')} Anexos</h4><div class="notice">Os anexos ainda não foram ativados no banco. O administrador precisa executar o arquivo <b>atualizacao-02-anexos.sql</b> no SQL Editor do Supabase.</div></div>` : '';
+    }
+    if (!cd.attachments.length && !cd.uploading.length && !ed) return '';
+    const rows = cd.attachments.map((a) => {
+      const th = thumbCache[a.storage_path];
+      const ext = (extOf(a.file_name) || '?').toUpperCase().slice(0, 4);
+      return `
+        <div class="att">
+          <button class="att-thumb" data-act="open-att" data-id="${a.id}" title="Abrir">${th && isImage(a) ? `<img src="${esc(th.url)}" alt="">` : `<span>${esc(ext)}</span>`}</button>
+          <div class="att-info">
+            <button class="att-name" data-act="open-att" data-id="${a.id}">${esc(a.file_name)}</button>
+            <div class="small muted">${fmtSize(a.size_bytes)} · ${esc(userName(a.uploaded_by))} · ${relTime(a.created_at)}</div>
+            <div class="att-acts">
+              <button data-act="download-att" data-id="${a.id}">Baixar</button>
+              ${canManage() ? `<button data-act="delete-att" data-id="${a.id}">Excluir</button>` : ''}
+            </div>
+          </div>
+        </div>`;
+    }).join('');
+    const up = cd.uploading.map((n) => `<div class="att uploading"><div class="att-thumb"><span class="spin"></span></div><div class="att-info"><div>${esc(n)}</div><div class="small muted">Enviando...</div></div></div>`).join('');
+    return `
+      <div class="cm-section">
+        <h4>${icon('clip')} Anexos ${cd.attachments.length ? `<span class="muted small" style="font-weight:500">(${cd.attachments.length})</span>` : ''}
+          ${ed ? '<button class="btn sm" data-act="pick-files" style="margin-left:auto">Adicionar</button>' : ''}</h4>
+        ${up}${rows}
+        ${ed ? `<p class="small muted" style="line-height:1.5;margin:6px 0 0">PDF, imagens, Word, Excel e compactados, até 10 MB cada. Você também pode arrastar arquivos para esta janela ou colar um print com Ctrl + V. Fotos grandes são reduzidas automaticamente para economizar o espaço do sistema.</p>
+          <input type="file" id="att-input" multiple accept="${ATT_ACCEPT}" hidden data-change="att-files">` : ''}
+        ${!ed && !cd.attachments.length ? '<p class="empty">Nenhum anexo.</p>' : ''}
+      </div>`;
+  }
+
+  // ------------------------------------------------------------------------
   // Exportação CSV
   // ------------------------------------------------------------------------
   async function exportCsv() {
@@ -1437,7 +1615,7 @@
     const lord = Object.fromEntries(S.lists.map((l, i) => [l.id, i]));
     cards.sort((a, b) => (lord[a.list_id] - lord[b.list_id]) || (a.position - b.position));
     const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-    const head = ['Lista', 'Cartão', 'Descrição', 'Etiquetas', 'Responsáveis', 'Início', 'Entrega', 'Situação', 'Checklist', 'Arquivado', 'Criado por', 'Criado em', 'Atualizado em'];
+    const head = ['Lista', 'Cartão', 'Descrição', 'Etiquetas', 'Responsáveis', 'Início', 'Entrega', 'Situação', 'Checklist', 'Anexos', 'Arquivado', 'Criado por', 'Criado em', 'Atualizado em'];
     const rows = cards.map((c) => {
       const s = S.stats[c.id] || {};
       const st = dueStatus(c);
@@ -1450,6 +1628,7 @@
         c.due_date ? new Date(c.due_date).toLocaleString('pt-BR') : '',
         c.completed ? 'Concluído' : st === 'overdue' ? 'Atrasado' : 'Em aberto',
         s.items_total ? `${s.items_done}/${s.items_total}` : '',
+        s.attachments || '',
         c.archived ? 'Sim' : 'Não',
         userName(c.created_by),
         new Date(c.created_at).toLocaleString('pt-BR'),
@@ -1567,7 +1746,8 @@
       await afterCardChange();
     },
     'delete-card': async (el) => {
-      if (!(await confirmDialog('Excluir este cartão definitivamente? Comentários e checklists serão apagados. O registro no histórico do quadro é mantido.', { confirmText: 'Excluir', danger: true }))) return;
+      if (!(await confirmDialog('Excluir este cartão definitivamente? Comentários, checklists e anexos serão apagados. O registro no histórico do quadro é mantido.', { confirmText: 'Excluir', danger: true }))) return;
+      await removeStoredFiles(await attachmentPaths({ card_id: el.dataset.id }));
       await q(sb.from('cards').delete().eq('id', el.dataset.id));
       toast('Cartão excluído.');
       if (S.cd && S.cd.card.id === el.dataset.id) closeCard();
@@ -1576,7 +1756,9 @@
     'restore-list': async (el) => { await q(sb.from('lists').update({ archived: false }).eq('id', el.dataset.id)); await refreshBoard(); },
     'delete-list': async (el) => {
       const l = S.lists.find((x) => x.id === el.dataset.id);
-      if (!(await confirmDialog(`Excluir definitivamente a lista <b>${esc(l.title)}</b> e todos os cartões dela?`, { confirmText: 'Excluir', danger: true }))) return;
+      if (!(await confirmDialog(`Excluir definitivamente a lista <b>${esc(l.title)}</b> e todos os cartões e anexos dela?`, { confirmText: 'Excluir', danger: true }))) return;
+      const ids = (await q(sb.from('cards').select('id').eq('list_id', l.id))).map((c) => c.id);
+      for (let i = 0; i < ids.length; i += 100) await removeStoredFiles(await attachmentPaths({ card_id: ids.slice(i, i + 100) }));
       await q(sb.from('lists').delete().eq('id', l.id));
       await refreshBoard();
     },
@@ -1588,7 +1770,8 @@
       await refreshBoard();
     },
     'delete-board': async () => {
-      if (!(await confirmDialog('Esta ação apaga o quadro, as listas, os cartões e os comentários. Não pode ser desfeita.', { confirmText: 'Excluir quadro', danger: true, requireText: S.board.title }))) return;
+      if (!(await confirmDialog('Esta ação apaga o quadro, as listas, os cartões, os comentários e os anexos. Não pode ser desfeita.', { confirmText: 'Excluir quadro', danger: true, requireText: S.board.title }))) return;
+      await removeStoredFiles(await attachmentPaths({ board_id: S.board.id }));
       await q(sb.from('boards').delete().eq('id', S.board.id));
       toast('Quadro excluído.');
       cleanupBoard();
@@ -1599,6 +1782,34 @@
     // cartão
     'open-card': (el, ev) => { if (ev.target.closest('a')) return; go(`#/b/${S.board.id}/c/${el.dataset.id}`); },
     'close-card': () => closeCard(),
+    'pick-files': () => { const i = $('#att-input'); if (i) i.click(); },
+    'open-att': async (el) => {
+      const a = S.cd.attachments.find((x) => x.id === el.dataset.id);
+      if (!a) return;
+      if (!isPreviewable(a)) return A['download-att'](el);
+      const w = window.open('', '_blank');
+      const { data, error } = await bucket().createSignedUrl(a.storage_path, 300);
+      if (error) { if (w) w.close(); throw error; }
+      if (w) w.location.href = data.signedUrl; else location.href = data.signedUrl;
+    },
+    'download-att': async (el) => {
+      const a = S.cd.attachments.find((x) => x.id === el.dataset.id);
+      if (!a) return;
+      const { data, error } = await bucket().createSignedUrl(a.storage_path, 300, { download: a.file_name });
+      if (error) throw error;
+      const link = document.createElement('a');
+      link.href = data.signedUrl; link.rel = 'noopener';
+      document.body.appendChild(link); link.click(); link.remove();
+    },
+    'delete-att': async (el) => {
+      const a = S.cd.attachments.find((x) => x.id === el.dataset.id);
+      if (!a) return;
+      if (!(await confirmDialog(`Excluir o anexo <b>${esc(a.file_name)}</b>? O arquivo será apagado definitivamente.`, { confirmText: 'Excluir', danger: true }))) return;
+      await q(sb.from('attachments').delete().eq('id', a.id));
+      try { await removeStoredFiles([a.storage_path]); } catch (e) { console.warn(e); }
+      toast('Anexo excluído.');
+      await afterCardChange();
+    },
     'edit-desc': (el, ev) => { if (ev.target.closest('a')) return; S.cd.editingDesc = true; renderCardModal(); },
     'cancel-desc': () => { S.cd.editingDesc = false; renderCardModal(); },
     'toggle-details': () => { S.cd.showDetails = !S.cd.showDetails; renderCardModal(); },
@@ -1913,6 +2124,7 @@
       await q(sb.from('cards').update({ list_id: el.value, position }).eq('id', S.cd.card.id));
       await afterCardChange();
     },
+    'att-files': async (el) => { const files = Array.from(el.files || []); el.value = ''; await uploadFiles(files); },
     'toggle-complete': async (el) => {
       await q(sb.from('cards').update({ completed: el.checked }).eq('id', S.cd.card.id));
       await afterCardChange();
@@ -2017,6 +2229,35 @@
       if (f && document.contains(f)) setTimeout(() => { if (document.contains(f)) f.requestSubmit(); }, 0);
     }
   });
+
+  // Arrastar arquivos para o cartão aberto e colar prints
+  const hasFiles = (ev) => ev.dataTransfer && Array.from(ev.dataTransfer.types || []).includes('Files');
+  document.addEventListener('dragover', (ev) => {
+    if (!hasFiles(ev)) return;
+    ev.preventDefault();
+    const m = $('#modal-root .modal');
+    const ok = S.cd && canEdit() && !S.cd.attUnavailable && m && m.contains(ev.target);
+    ev.dataTransfer.dropEffect = ok ? 'copy' : 'none';
+    if (m) m.classList.toggle('dropping', !!ok);
+  });
+  document.addEventListener('dragleave', (ev) => {
+    const m = $('#modal-root .modal');
+    if (m && (!ev.relatedTarget || !m.contains(ev.relatedTarget))) m.classList.remove('dropping');
+  });
+  document.addEventListener('drop', safely(async (ev) => {
+    if (!hasFiles(ev)) return;
+    ev.preventDefault();
+    const m = $('#modal-root .modal');
+    if (m) m.classList.remove('dropping');
+    if (S.cd && canEdit() && !S.cd.attUnavailable && m && m.contains(ev.target)) await uploadFiles(ev.dataTransfer.files);
+  }));
+  document.addEventListener('paste', safely(async (ev) => {
+    if (!S.cd || !canEdit() || S.cd.attUnavailable || !ev.clipboardData) return;
+    const files = Array.from(ev.clipboardData.files || []);
+    if (!files.length) return;
+    ev.preventDefault();
+    await uploadFiles(files);
+  }));
 
   document.addEventListener('keydown', (ev) => {
     const el = ev.target;
