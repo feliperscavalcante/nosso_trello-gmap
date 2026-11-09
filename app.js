@@ -30,7 +30,7 @@
     cardLabels: [], assignees: [], stats: {},
     filters: { q: '', member: '', label: '', due: '' }, showFilters: false,
     drawer: null, drawerData: {}, addingCardTo: null, addingList: false, renamingList: null,
-    openCard: null, cd: null,
+    openCard: null, cd: null, zoom: 1,
     channel: null, refreshTimer: null, pendingRefresh: false, dragging: false,
     pop: null, authMode: 'login', authMsg: null, admin: null
   };
@@ -156,6 +156,8 @@
     calendar: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>',
     eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
     key: '<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M17 6l3 3"/>',
+    minus: '<path d="M5 12h14"/>',
+    fit: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
     clip: '<path d="M21 11.5 12.5 20a5 5 0 0 1-7-7l9-9a3.5 3.5 0 0 1 5 5l-9 9a2 2 0 0 1-3-3l8-8"/>'
   };
   const icon = (n, s = 16) => `<svg width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[n] || ''}</svg>`;
@@ -407,6 +409,7 @@
       cleanupBoard();
       S.filters = { q: '', member: '', label: '', due: '' };
       S.showFilters = false;
+      S.zoom = loadZoom(boardId);
       const ok = await loadBoard(boardId);
       if (!ok) { toast('Quadro não encontrado ou você não tem acesso.', true); return go('#/'); }
       renderBoard();
@@ -475,6 +478,7 @@
 
   function cleanupBoard() {
     if (S.channel) { try { sb.removeChannel(S.channel); } catch (e) { /* ignora */ } }
+    document.body.classList.remove('board-zoomed');
     Object.assign(S, { channel: null, board: null, role: null, drawer: null, addingCardTo: null, addingList: false, renamingList: null, pendingRefresh: false });
     if (S.openCard) closeModal();
   }
@@ -516,6 +520,7 @@
 
   function renderBoard() {
     const b = S.board;
+    document.body.classList.toggle('board-zoomed', S.zoom !== 1);
     const color = safeColor(b.color);
     const members = S.members.slice().sort((x, y) => userName(x.user_id).localeCompare(userName(y.user_id)));
     const fa = filtersActive();
@@ -528,15 +533,21 @@
           ${b.archived ? '<span class="role-chip" style="background:#f5cd47;color:#533f04">Arquivado</span>' : ''}
           <div class="spacer"></div>
           <div class="avatars hide-sm" style="margin-right:4px">${members.slice(0, 6).map((m) => avatar(m.user_id, 'sm')).join('')}${members.length > 6 ? `<span class="avatar sm" style="background:#44546f">+${members.length - 6}</span>` : ''}</div>
+          <div class="zoom-ctl" role="group" aria-label="Zoom do quadro">
+            <button data-act="zoom" data-dir="-1" title="Diminuir zoom">${icon('minus', 14)}</button>
+            <button data-act="zoom-reset" class="zoom-pct" title="Voltar para 100%">${Math.round(S.zoom * 100)}%</button>
+            <button data-act="zoom" data-dir="1" title="Aumentar zoom">${icon('plus', 14)}</button>
+            <button data-act="zoom-fit" title="Ajustar à tela (mostrar todas as listas)">${icon('fit', 14)}</button>
+          </div>
           <button class="btn sm ${S.showFilters || fa ? 'on' : ''}" data-act="toggle-filters">${icon('filter', 14)}<span class="hide-sm">Filtros${fa ? ' (ativos)' : ''}</span></button>
           <button class="btn sm" data-act="drawer" data-view="members">${icon('users', 14)}<span class="hide-sm">Membros</span></button>
           <button class="btn sm" data-act="drawer" data-view="menu" title="Menu do quadro">${icon('dots', 14)}</button>
         </div>
         ${S.showFilters || fa ? renderFilters(members) : ''}
-        <div class="lists" id="lists">
+        <div class="lists-wrap"><div class="lists" id="lists" style="--z:${S.zoom}">
           ${activeLists().map(renderList).join('')}
           ${canEdit() ? renderAddList() : ''}
-        </div>
+        </div></div>
       </div>
       ${S.drawer ? '<aside class="drawer" id="drawer"></aside>' : ''}`;
     if (S.drawer) renderDrawer();
@@ -622,13 +633,33 @@
       </div>`;
   }
 
+  // Zoom do quadro (salvo por quadro, neste navegador)
+  const ZOOM_STEPS = [0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.1, 1.25, 1.5];
+  function loadZoom(boardId) {
+    try { const v = Number(localStorage.getItem('zoom:' + boardId)); if (v >= 0.5 && v <= 1.5) return v; } catch (e) { /* sem armazenamento */ }
+    return 1;
+  }
+  function setZoom(z) {
+    S.zoom = Math.round(z * 100) / 100;
+    try { localStorage.setItem('zoom:' + S.board.id, String(S.zoom)); } catch (e) { /* sem armazenamento */ }
+    const el = $('#lists');
+    if (el) {
+      const ratio = el.scrollLeft / Math.max(1, el.scrollWidth - el.clientWidth);
+      el.style.setProperty('--z', S.zoom);
+      el.scrollLeft = ratio * Math.max(0, el.scrollWidth - el.clientWidth);
+    }
+    const pct = $('.zoom-pct');
+    if (pct) pct.textContent = Math.round(S.zoom * 100) + '%';
+    document.body.classList.toggle('board-zoomed', S.zoom !== 1);
+  }
+
   // Arrastar e soltar
   let sortables = [];
   function setupSortable() {
     sortables.forEach((s) => s.destroy());
     sortables = [];
     if (!canEdit() || !window.Sortable) return;
-    const common = { animation: 150, delay: 180, delayOnTouchOnly: true, forceFallback: true, fallbackTolerance: 4,
+    const common = { animation: 150, delay: 180, delayOnTouchOnly: true, forceFallback: true, fallbackTolerance: 4, fallbackOnBody: true,
       ghostClass: 'card-ghost', chosenClass: 'card-drag',
       onStart: () => { S.dragging = true; }, };
     $$('.cards').forEach((el) => {
@@ -1678,6 +1709,21 @@
     'goto-card': (el) => go(`#/b/${el.dataset.board}/c/${el.dataset.id}`),
 
     // quadro
+    zoom: (el) => {
+      const dir = Number(el.dataset.dir);
+      const cur = S.zoom;
+      const next = dir > 0 ? ZOOM_STEPS.find((z) => z > cur + 0.001) : [...ZOOM_STEPS].reverse().find((z) => z < cur - 0.001);
+      setZoom(next || cur);
+    },
+    'zoom-reset': () => setZoom(1),
+    'zoom-fit': () => {
+      const el = $('#lists');
+      if (!el) return;
+      const natural = el.scrollWidth / S.zoom;
+      const fit = Math.floor((el.clientWidth / natural) * 100) / 100;
+      setZoom(Math.max(ZOOM_STEPS[0], Math.min(1, fit)));
+      if (fit < ZOOM_STEPS[0]) toast('O quadro tem listas demais para caber inteiro; ajustado ao menor zoom (50%).');
+    },
     'toggle-filters': () => { S.showFilters = !S.showFilters; renderBoard(); },
     'clear-filters': () => { S.filters = { q: '', member: '', label: '', due: '' }; renderBoard(); },
     'add-card': (el) => { S.addingCardTo = el.dataset.list; renderBoard(); },

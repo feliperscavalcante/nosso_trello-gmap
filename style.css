@@ -330,3 +330,19 @@ a { color: var(--primary); }
 @keyframes spin { to { transform: rotate(360deg); } }
 .modal.dropping { box-shadow: 0 0 0 4px var(--primary), var(--shadow-pop); }
 .modal.dropping::after { content: "Solte os arquivos para anexar"; position: absolute; inset: 0; display: grid; place-items: center; background: #e9f2ffe6; color: #0c4a8a; font-weight: 700; font-size: 18px; border-radius: 12px; pointer-events: none; z-index: 5; }
+
+/* ---------- Zoom do quadro ---------- */
+.lists-wrap { flex: 1; min-height: 0; position: relative; overflow: hidden; }
+.lists-wrap > .lists { position: absolute; top: 0; left: 0; zoom: var(--z, 1); width: 100%; height: 100%; }
+.zoom-ctl { display: inline-flex; align-items: center; background: #ffffff33; border-radius: 6px; overflow: hidden; }
+.zoom-ctl button { border: 0; background: transparent; color: #fff; height: 30px; min-width: 30px; padding: 0 6px; cursor: pointer; display: inline-grid; place-items: center; font-weight: 600; font-size: 13px; }
+.zoom-ctl button:hover { background: #ffffff33; }
+.zoom-ctl .zoom-pct { min-width: 48px; }
+@media (max-width: 680px) { .zoom-ctl [data-act="zoom-fit"] { display: none; } .zoom-ctl .zoom-pct { min-width: 40px; } }
+/* Com zoom diferente de 100%, o cartão arrastado aparece só na posição de destino */
+.board-zoomed .sortable-fallback { opacity: 0 !important; }
+.card, .list-head { -webkit-user-select: none; user-select: none; }
+/* Espaço de destino durante o arraste */
+.cards .card-ghost:not(.sortable-fallback) { opacity: 1; transform: none; background: #091e421f; box-shadow: none; }
+.cards .card-ghost:not(.sortable-fallback) > * { visibility: hidden; }
+.lists .list.card-ghost:not(.sortable-fallback) { opacity: .5; transform: none; }
