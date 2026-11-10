@@ -375,3 +375,6 @@ a { color: var(--primary); }
 .popover .opt { align-items: flex-start; }
 .popover .opt svg { margin-top: 2px; flex: none; }
 @media (max-width: 680px) { .form-data { grid-template-columns: 1fr; gap: 2px; } .form-data dd { margin-bottom: 8px; } }
+
+.icon-btn:disabled { opacity: .35; cursor: default; }
+.icon-btn:disabled:hover { background: transparent; }

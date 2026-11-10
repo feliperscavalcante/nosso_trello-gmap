@@ -2084,7 +2084,11 @@
                   <input class="input" type="number" min="0" step="1" style="width:110px" value="${o.due_hours ?? ''}" data-tf="fields.${i}.options.${j}.due_hours" data-tf-type="num" placeholder="Horas">
                   <input class="input" style="flex:1 1 160px" value="${esc(o.tag_name || '')}" data-tf="fields.${i}.options.${j}.tag_name" maxlength="40" placeholder="Etiqueta (opcional)">
                   <input type="color" value="${safeColor(o.tag_color, '#64748b')}" data-tf="fields.${i}.options.${j}.tag_color" title="Cor da etiqueta">` : ''}
-                <button type="button" class="icon-btn" data-act="tpl-del-opt" data-i="${i}" data-j="${j}" title="Remover opção">${icon('x', 14)}</button>
+                <span class="row" style="gap:0">
+                  <button type="button" class="icon-btn" data-act="tpl-move-opt" data-i="${i}" data-j="${j}" data-dir="-1" title="Subir opção" ${j === 0 ? 'disabled' : ''}>${icon('up', 14)}</button>
+                  <button type="button" class="icon-btn" data-act="tpl-move-opt" data-i="${i}" data-j="${j}" data-dir="1" title="Descer opção" ${j === f.options.length - 1 ? 'disabled' : ''}>${icon('down', 14)}</button>
+                  <button type="button" class="icon-btn" data-act="tpl-del-opt" data-i="${i}" data-j="${j}" title="Remover opção">${icon('x', 14)}</button>
+                </span>
               </div>`).join('')}
             <button type="button" class="btn sm" data-act="tpl-add-opt" data-i="${i}">${icon('plus', 14)} Adicionar opção</button>` : ''}
         </div>`;
@@ -2340,6 +2344,13 @@
       [F[i], F[j]] = [F[j], F[i]]; renderTplEditor();
     },
     'tpl-add-opt': (el) => { S.tplEdit.fields[Number(el.dataset.i)].options.push({ label: '' }); renderTplEditor(); },
+    'tpl-move-opt': (el) => {
+      const O = S.tplEdit.fields[Number(el.dataset.i)].options;
+      const j = Number(el.dataset.j), k = j + Number(el.dataset.dir);
+      if (k < 0 || k >= O.length) return;
+      [O[j], O[k]] = [O[k], O[j]];
+      renderTplEditor();
+    },
     'tpl-del-opt': (el) => { S.tplEdit.fields[Number(el.dataset.i)].options.splice(Number(el.dataset.j), 1); renderTplEditor(); },
     'tpl-preview': () => {
       const t = cleanTemplate(JSON.parse(JSON.stringify(S.tplEdit)));
