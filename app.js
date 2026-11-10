@@ -13,6 +13,8 @@
   const configured = !!(CFG.SUPABASE_URL && CFG.SUPABASE_ANON_KEY &&
     !CFG.SUPABASE_URL.includes('SEU-PROJETO') && !CFG.SUPABASE_ANON_KEY.includes('COLE_AQUI'));
   const sb = configured ? window.supabase.createClient(CFG.SUPABASE_URL, CFG.SUPABASE_ANON_KEY) : null;
+  // Ganchos opcionais usados apenas pela versão de demonstração (ausentes no sistema publicado)
+  const demoHook = (k, ...args) => (typeof CFG[k] === 'function' ? (CFG[k](...args), true) : false);
   document.title = APP_NAME;
 
   const BOARD_COLORS = ['#1f6fb5', '#24507d', '#2e8b57', '#0f766e', '#7a4fa3', '#b23a48', '#c0632b', '#8a6d1f', '#475569'];
@@ -158,6 +160,9 @@
     eye: '<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
     key: '<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M17 6l3 3"/>',
     minus: '<path d="M5 12h14"/>',
+    form: '<rect x="5" y="3" width="14" height="18" rx="2"/><path d="M9 3v3h6V3M9 11h6M9 15h4"/>',
+    up: '<path d="m6 15 6-6 6 6"/>',
+    down: '<path d="m6 9 6 6 6-6"/>',
     fit: '<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
     clip: '<path d="M21 11.5 12.5 20a5 5 0 0 1-7-7l9-9a3.5 3.5 0 0 1 5 5l-9 9a2 2 0 0 1-3-3l8-8"/>'
   };
@@ -189,11 +194,12 @@
     const prevUser = S.session && S.session.user && S.session.user.id;
     S.session = session;
     if (event === 'PASSWORD_RECOVERY') { S.recovery = true; return openNewPasswordModal(); }
-    if (event === 'SIGNED_OUT') { cleanupBoard(); S.me = null; S.profiles = {}; closeModal(); return route(); }
+    if (event === 'SIGNED_OUT') { if (!prevUser) return; cleanupBoard(); S.me = null; S.profiles = {}; closeModal(); return route(); }
     if (event === 'SIGNED_IN' && session && session.user.id !== prevUser) { await loadMe(); route(); }
   }
 
   async function loadMe() {
+    if (!S.session) { S.me = null; return; }
     try {
       const rows = await q(sb.from('profiles').select('*').order('full_name'));
       S.profiles = Object.fromEntries(rows.map((p) => [p.id, p]));
@@ -248,8 +254,8 @@
     if (m === 'login') {
       form = `
         <form data-submit="login">
-          <label class="field"><span>E-mail</span><input class="input" type="email" name="email" required autocomplete="email" data-autofocus></label>
-          <label class="field"><span>Senha</span><input class="input" type="password" name="password" required autocomplete="current-password"></label>
+          <label class="field"><span>E-mail</span><input class="input" type="email" name="email" required autocomplete="email" value="${esc(S.authEmail || '')}" ${S.authEmail ? '' : 'data-autofocus'}></label>
+          <label class="field"><span>Senha</span><input class="input" type="password" name="password" required autocomplete="current-password" ${S.authEmail ? 'data-autofocus' : ''}></label>
           <button class="btn primary" style="width:100%" type="submit">Entrar</button>
           ${CFG.EMAIL_ENABLED
             ? '<p class="small" style="text-align:center;margin:14px 0 0"><a href="#" data-act="auth-mode" data-mode="forgot">Esqueci minha senha</a></p>'
@@ -323,8 +329,11 @@
   // Página inicial
   // ------------------------------------------------------------------------
   async function showHome() {
+    const me = S.me;
+    if (!me) return;
     S.boards = await q(sb.from('boards').select('*').order('title'));
-    const asg = await q(sb.from('card_assignees').select('card_id').eq('user_id', S.me.id));
+    if (S.me !== me) return; // a sessão mudou durante o carregamento
+    const asg = await q(sb.from('card_assignees').select('card_id').eq('user_id', me.id));
     const ids = uniq(asg.map((a) => a.card_id));
     let tasks = [];
     if (ids.length) {
@@ -339,11 +348,13 @@
         .map((t) => ({ ...t, list: lmap[t.list_id].title, board: bmap[t.board_id] }))
         .sort((a, b) => (a.due_date ? new Date(a.due_date) : Infinity) - (b.due_date ? new Date(b.due_date) : Infinity));
     }
+    if (S.me !== me) return;
     S.myTasks = tasks;
     renderHome();
   }
 
   function renderHome() {
+    if (!S.session || !S.me) return;
     const boards = S.boards.filter((b) => S.showArchivedBoards || !b.archived);
     const nArch = S.boards.filter((b) => b.archived).length;
     const first = S.me.full_name.split(' ')[0];
@@ -411,7 +422,7 @@
   async function showBoard(boardId, cardId) {
     if (!S.board || S.board.id !== boardId) {
       cleanupBoard();
-      S.filters = { q: '', member: '', label: '', due: '' };
+      S.filters = { q: '', member: '', label: '', due: '', template: '' };
       S.showFilters = false;
       S.zoom = loadZoom(boardId);
       const ok = await loadBoard(boardId);
@@ -432,8 +443,9 @@
       q(sb.from('board_members').select('*').eq('board_id', id)),
       q(sb.from('card_labels').select('card_id,label_id').eq('board_id', id)),
       q(sb.from('card_assignees').select('card_id,user_id').eq('board_id', id)),
-      q(sb.rpc('board_card_stats', { b: id }))
-    ]);
+      q(sb.rpc('board_card_stats', { b: id })),
+      sb.from('card_templates').select('*').eq('active', true).order('name')
+    ]).then((r) => { const t = r.pop(); S.templates = t.error ? [] : t.data; return r; });
     if (!board) return false;
     Object.assign(S, { board, lists, cards, labels, members, cardLabels, assignees });
     S.stats = Object.fromEntries((stats || []).map((s) => [s.card_id, s]));
@@ -471,7 +483,7 @@
   }
   async function doRefresh() {
     if (!S.board) return;
-    if (S.dragging || isEditing() || S.pop) { S.pendingRefresh = true; return; }
+    if (S.dragging || isEditing() || S.pop || S.tplForm || S.tplEdit) { S.pendingRefresh = true; return; }
     S.pendingRefresh = false;
     try {
       await refreshBoard();
@@ -493,12 +505,12 @@
   const cardLabelIds = (cid) => S.cardLabels.filter((x) => x.card_id === cid).map((x) => x.label_id);
   const cardAssigneeIds = (cid) => S.assignees.filter((x) => x.card_id === cid).map((x) => x.user_id);
   const activeLists = () => S.lists.filter((l) => !l.archived);
-  const filtersActive = () => !!(S.filters.q || S.filters.member || S.filters.label || S.filters.due);
+  const filtersActive = () => !!(S.filters.q || S.filters.member || S.filters.label || S.filters.due || S.filters.template);
 
   function matchesFilters(c) {
     const f = S.filters;
     if (f.q) {
-      const t = (c.title + ' ' + c.description).toLowerCase();
+      const t = (c.title + ' ' + c.description + ' ' + formDataText(c)).toLowerCase();
       if (!t.includes(f.q.toLowerCase())) return false;
     }
     if (f.member) {
@@ -507,6 +519,7 @@
       else if (!cardAssigneeIds(c.id).includes(who)) return false;
     }
     if (f.label && !cardLabelIds(c.id).includes(f.label)) return false;
+    if (f.template && (f.template === 'none' ? c.template_id || c.template_name : c.template_name !== f.template)) return false;
     if (f.due) {
       const st = dueStatus(c);
       if (f.due === 'overdue' && st !== 'overdue') return false;
@@ -523,6 +536,7 @@
   }
 
   function renderBoard() {
+    if (!S.session || !S.me) return;
     const b = S.board;
     document.body.classList.toggle('board-zoomed', S.zoom !== 1);
     const color = safeColor(b.color);
@@ -582,6 +596,12 @@
           <option value="open" ${f.due === 'open' ? 'selected' : ''}>Não concluídos</option>
           <option value="done" ${f.due === 'done' ? 'selected' : ''}>Concluídos</option>
         </select>
+        ${(() => { const names = uniq(S.cards.map((c) => c.template_name).filter(Boolean)).sort(); return names.length ? `
+        <select class="select" data-change="filter" data-key="template">
+          <option value="">Todos os tipos de cartão</option>
+          <option value="none" ${f.template === 'none' ? 'selected' : ''}>Cartões padrão</option>
+          ${names.map((n) => `<option value="${esc(n)}" ${f.template === n ? 'selected' : ''}>${esc(n)}</option>`).join('')}
+        </select>` : ''; })()}
         ${filtersActive() ? '<button class="btn sm" data-act="clear-filters">Limpar filtros</button>' : ''}
       </div>`;
   }
@@ -601,11 +621,12 @@
           ${canEdit() ? `<button class="icon-btn" data-act="list-menu" data-id="${l.id}" title="Ações da lista">${icon('dots')}</button>` : ''}
         </div>
         <div class="cards" data-list-cards="${l.id}">${cards.map(renderCardTile).join('')}</div>
+        ${!canEdit() && canUseTemplates() ? `<div class="list-foot"><button class="btn add-card-btn" data-act="add-card" data-list="${l.id}">${icon('form')} Nova solicitação</button></div>` : ''}
         ${canEdit() ? `<div class="list-foot">${S.addingCardTo === l.id ? `
           <form data-submit="add-card" data-list="${l.id}">
             <textarea class="textarea" name="title" rows="2" style="min-height:56px" placeholder="Insira um título para este cartão..." maxlength="300" data-autofocus data-enter-submit></textarea>
             <div class="row" style="margin-top:8px"><button class="btn primary sm" type="submit">Adicionar cartão</button><button class="icon-btn" type="button" data-act="cancel-add-card">${icon('x')}</button></div>
-          </form>` : `<button class="btn add-card-btn" data-act="add-card" data-list="${l.id}">${icon('plus')} Adicionar um cartão</button>`}</div>` : '<div style="height:8px"></div>'}
+          </form>` : `<button class="btn add-card-btn" data-act="add-card" data-list="${l.id}">${icon('plus')} Adicionar um cartão</button>`}</div>` : (canUseTemplates() ? '' : '<div style="height:8px"></div>')}
       </div>`;
   }
 
@@ -625,6 +646,7 @@
     const badges = [];
     if (c.due_date) badges.push(`<span class="badge due ${st || ''}" title="Entrega">${icon(c.completed ? 'checksq' : 'clock', 13)} ${fmtDate(c.due_date)}</span>`);
     else if (c.completed) badges.push(`<span class="badge ok">${icon('checksq', 13)} Concluído</span>`);
+    if (c.template_name) badges.push(`<span class="badge" title="${esc(c.template_name)}">${icon('form', 13)}</span>`);
     if (c.description) badges.push(`<span class="badge" title="Possui descrição">${icon('desc', 13)}</span>`);
     if (s.comments) badges.push(`<span class="badge" title="Comentários">${icon('comment', 13)} ${s.comments}</span>`);
     if (s.attachments) badges.push(`<span class="badge" title="Anexos">${icon('clip', 13)} ${s.attachments}</span>`);
@@ -933,6 +955,7 @@
       case 'comment_deleted': return `excluiu um comentário${on}`;
       case 'attachment_added': return `anexou ${T(d.name)}${on}`;
       case 'attachment_removed': return `removeu o anexo ${T(d.name)}${on}`;
+      case 'card_form_edited': return `editou as respostas da solicitação${on}`;
       default: return esc(a.action);
     }
   }
@@ -987,6 +1010,7 @@
   function closeCard() { if (S.board) go(`#/b/${S.board.id}`); else closeModal(); }
 
   function renderCardModal() {
+    if (!S.session || !S.me) return;
     const cd = S.cd; const c = cd.card;
     const ed = canEdit() && !S.board.archived;
     const list = S.lists.find((l) => l.id === c.list_id);
@@ -1095,6 +1119,7 @@
         <div class="cm-grid">
           <div>
             ${meta.length ? `<div class="meta-row">${meta.join('')}</div>` : ''}
+            ${renderFormData(c)}
             <div class="cm-section"><h4>${icon('desc')} Descrição ${ed && c.description && !cd.editingDesc ? '<button class="btn sm" data-act="edit-desc" style="margin-left:auto">Editar</button>' : ''}</h4>${desc}</div>
             ${renderAttachments(ed)}
             ${checklists}
@@ -1282,7 +1307,8 @@
     const limit = (S.admin && S.admin.auditLimit) || 30;
     const pr = await sb.from('pre_registrations').select('*').is('used_at', null).order('created_at', { ascending: false });
     const au = await sb.from('admin_audit').select('*').order('created_at', { ascending: false }).limit(limit);
-    S.admin = { cfg: cfg || {}, boards, usage, prereg: pr.error ? null : pr.data, audit: au.error ? null : au.data, auditLimit: limit };
+    const tp = await sb.from('card_templates').select('*').order('name');
+    S.admin = { templates: tp.error ? null : tp.data, cfg: cfg || {}, boards, usage, prereg: pr.error ? null : pr.data, audit: au.error ? null : au.data, auditLimit: limit };
     renderAdmin();
   }
 
@@ -1303,6 +1329,7 @@
   }
 
   function renderAdmin() {
+    if (!S.session || !S.me) return;
     const order = { pending: 0, active: 1, inactive: 2 };
     const users = Object.values(S.profiles).sort((a, b) => order[a.status] - order[b.status] || a.full_name.localeCompare(b.full_name));
     const pend = users.filter((u) => u.status === 'pending').length;
@@ -1338,6 +1365,7 @@
           <p class="small muted" style="line-height:1.5;margin-bottom:0">Desativar bloqueia o acesso imediatamente, mas preserva o histórico do servidor. Administradores enxergam e gerenciam todos os quadros.</p>
           ${renderPreRegs()}
         </section>
+        ${renderTemplatesAdmin()}
         ${renderAudit()}
         <section class="panel" style="margin-bottom:20px">
           <h2>${icon('board')} Importar do Trello</h2>
@@ -1681,7 +1709,12 @@
     password_reset: (t) => `redefiniu a senha de ${t}`,
     password_changed: () => 'trocou a senha provisória pela própria senha',
     user_status: (t, d) => `alterou a situação de ${t} de ${esc(STATUS_NAME[d.from] || d.from)} para <b>${esc(STATUS_NAME[d.to] || d.to)}</b>`,
-    user_admin: (t, d) => (d.to ? `tornou ${t} administrador do sistema` : `retirou de ${t} o perfil de administrador`)
+    user_admin: (t, d) => (d.to ? `tornou ${t} administrador do sistema` : `retirou de ${t} o perfil de administrador`),
+    template_created: (t) => `criou o template ${t}`,
+    template_updated: (t) => `alterou o template ${t}`,
+    template_deleted: (t) => `excluiu o template ${t}`,
+    template_activated: (t) => `ativou o template ${t}`,
+    template_deactivated: (t) => `desativou o template ${t}`
   };
   const STATUS_NAME = { pending: 'Pendente', active: 'Ativo', inactive: 'Inativo' };
 
@@ -1796,6 +1829,373 @@
   }
 
   // ------------------------------------------------------------------------
+  // Templates de cartão (formulários de solicitação)
+  // ------------------------------------------------------------------------
+  const FIELD_TYPES = {
+    checkbox: 'Múltipla escolha (várias respostas)',
+    radio: 'Escolha única (botões)',
+    select: 'Lista suspensa (uma resposta)',
+    text: 'Texto curto',
+    textarea: 'Texto longo',
+    number: 'Número',
+    date: 'Data'
+  };
+  const CHOICE = (t) => t === 'checkbox' || t === 'radio' || t === 'select';
+  const boardTemplates = () => (S.templates || []).filter((t) => t.active && (t.all_boards || (t.boards || []).includes(S.board.id)));
+  const canUseTemplates = () => !!S.role && !S.board.archived && boardTemplates().length > 0;
+
+  function slugKey(label, used) {
+    let base = String(label || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 30) || 'campo';
+    let k = base, i = 2;
+    while (used.has(k)) k = `${base}_${i++}`;
+    return k;
+  }
+  function ensureKeys(tpl) {
+    const used = new Set(tpl.fields.filter((f) => f.key).map((f) => f.key));
+    tpl.fields.forEach((f) => { if (!f.key) { f.key = slugKey(f.label, used); used.add(f.key); } });
+  }
+
+  // Respostas atuais do formulário
+  function collectAnswers(form, tpl) {
+    const a = {};
+    tpl.fields.forEach((f) => {
+      const n = 'f_' + f.key;
+      if (f.type === 'checkbox') a[f.key] = $$(`input[name="${n}"]:checked`, form).map((i) => i.value);
+      else if (f.type === 'radio') { const c = $(`input[name="${n}"]:checked`, form); a[f.key] = c ? c.value : ''; }
+      else { const el = form.elements[n]; a[f.key] = el ? el.value.trim() : ''; }
+      const o = form.elements[n + '__other'];
+      if (o) a[f.key + '__other'] = o.value.trim();
+    });
+    return a;
+  }
+  function answerText(f, a) {
+    const v = a[f.key];
+    const list = Array.isArray(v) ? v : (v ? [v] : []);
+    return list.map((x) => (x === '__other__' ? (a[f.key + '__other'] || '') : x)).filter(Boolean).join(', ');
+  }
+  function suggestTitle(tpl, a) {
+    const pattern = (tpl.title_pattern || '').trim();
+    if (!pattern) return tpl.name;
+    let s = pattern.replace(/\{([a-z0-9_]+)\}/g, (m, k) => { const f = tpl.fields.find((x) => x.key === k); return f ? answerText(f, a) : ''; });
+    s = s.replace(/\s*([|,;])\s*(?=[|,;]|$)/g, '').replace(/:\s*(?=[|,;]|$)/g, ':').replace(/\s*[|,;:]\s*$/g, '').replace(/^\s*[|,;]\s*/, '');
+    s = s.replace(/:\s*\|\s*/g, ': ').replace(/\s{2,}/g, ' ').trim();
+    return s.length > 300 ? s.slice(0, 297) + '...' : s;
+  }
+  // Converte a cópia guardada no cartão de volta em respostas (para editar)
+  function answersFromCard(tpl, data) {
+    const a = {};
+    (data || []).forEach((d) => {
+      const f = tpl.fields.find((x) => x.key === d.key);
+      if (!f) return;
+      const vals = (d.values || []).map((v) => {
+        if (CHOICE(f.type) && /^Outros: /.test(v) && !(f.options || []).some((o) => o.label === v)) { a[f.key + '__other'] = v.replace(/^Outros: /, ''); return '__other__'; }
+        return v;
+      });
+      a[f.key] = f.type === 'checkbox' ? vals : (vals[0] || '');
+    });
+    return a;
+  }
+
+  function renderField(f, a) {
+    const n = 'f_' + f.key;
+    const v = a[f.key];
+    const req = f.required ? ' <span style="color:var(--danger)">*</span>' : '';
+    const help = f.help ? `<div class="small muted" style="margin:-2px 0 6px">${esc(f.help)}</div>` : '';
+    const otherVal = a[f.key + '__other'] || '';
+    let input = '';
+    if (f.type === 'checkbox' || f.type === 'radio') {
+      const sel = f.type === 'checkbox' ? (Array.isArray(v) ? v : []) : [v];
+      const opts = (f.options || []).map((o) => `
+        <label class="opt-check"><input type="${f.type}" name="${n}" value="${esc(o.label)}" ${sel.includes(o.label) ? 'checked' : ''} ${o.exclusive ? 'data-excl="1"' : ''}> <span>${esc(o.label)}</span></label>`).join('');
+      const other = f.allow_other ? `
+        <label class="opt-check"><input type="${f.type}" name="${n}" value="__other__" ${sel.includes('__other__') ? 'checked' : ''}> <span>Outros</span></label>
+        <input class="input other-input ${sel.includes('__other__') ? '' : 'hidden'}" name="${n}__other" value="${esc(otherVal)}" placeholder="Descreva" maxlength="200">` : '';
+      input = `<div class="opt-grid">${opts}${other}</div>`;
+    } else if (f.type === 'select') {
+      input = `<select class="select" name="${n}"><option value="">Selecione...</option>
+        ${(f.options || []).map((o) => `<option ${v === o.label ? 'selected' : ''}>${esc(o.label)}</option>`).join('')}
+        ${f.allow_other ? `<option value="__other__" ${v === '__other__' ? 'selected' : ''}>Outros...</option>` : ''}</select>
+        ${f.allow_other ? `<input class="input other-input ${v === '__other__' ? '' : 'hidden'}" style="margin-top:6px" name="${n}__other" value="${esc(otherVal)}" placeholder="Descreva" maxlength="200">` : ''}`;
+    } else if (f.type === 'textarea') {
+      input = `<textarea class="textarea" name="${n}" rows="4" maxlength="4000">${esc(v || '')}</textarea>`;
+    } else if (f.type === 'number') {
+      input = `<input class="input" type="number" step="any" name="${n}" value="${esc(v || '')}" style="max-width:220px">`;
+    } else if (f.type === 'date') {
+      input = `<input class="input" type="date" name="${n}" value="${esc(v || '')}" style="max-width:220px">`;
+    } else {
+      input = `<input class="input" name="${n}" value="${esc(v || '')}" maxlength="300">`;
+    }
+    return `<div class="field tpl-field" data-key="${esc(f.key)}"><span>${esc(f.label)}${req}</span>${help}${input}</div>`;
+  }
+
+  // mode: 'new' (criar cartão), 'edit' (editar respostas), 'preview' (pré-visualizar no construtor)
+  function openTemplateForm(tpl, opts) {
+    S.tplForm = { tpl, ...opts };
+    const a = opts.mode === 'edit' ? answersFromCard(tpl, opts.card.form_data) : {};
+    const lists = opts.mode === 'new' ? activeLists() : [];
+    const title = opts.mode === 'edit' ? 'Editar respostas' : opts.mode === 'preview' ? `Pré-visualização: ${tpl.name}` : tpl.name;
+    openModal(`
+      <div class="modal"><button class="icon-btn modal-close" data-act="close-tplform">${icon('x')}</button>
+      <div class="modal-body">
+        <h3>${icon('form', 18)} ${esc(title)}</h3>
+        ${tpl.description ? `<p class="muted" style="margin:-8px 0 16px;line-height:1.5">${esc(tpl.description)}</p>` : ''}
+        <form data-submit="tpl-form" data-tplform="1">
+          ${tpl.fields.map((f) => renderField(f, a)).join('')}
+          ${opts.mode !== 'edit' ? `
+          <hr style="border:0;border-top:1px solid var(--line);margin:8px 0 16px">
+          <label class="field"><span>Título do cartão</span>
+            <input class="input" name="__title" maxlength="300" value="${esc(suggestTitle(tpl, a))}" data-title-auto="1">
+            <div class="small muted" style="margin-top:4px">Sugerido a partir das respostas. Você pode ajustar.</div></label>
+          ${opts.mode === 'new' ? `<label class="field"><span>Lista</span><select class="select" name="__list">
+            ${lists.map((l) => `<option value="${l.id}" ${l.id === opts.listId ? 'selected' : ''}>${esc(l.title)}</option>`).join('')}</select></label>` : ''}` : `
+          <div class="notice">Se a prioridade for alterada, o prazo é recalculado a partir de agora e a etiqueta é trocada.</div>`}
+          <div class="row">
+            ${opts.mode === 'preview' ? '<button class="btn primary" type="button" data-act="close-tplform">Fechar pré-visualização</button>' : `
+            <button class="btn primary" type="submit">${opts.mode === 'edit' ? 'Salvar respostas' : 'Criar cartão'}</button>
+            <button class="btn" type="button" data-act="close-tplform">Cancelar</button>`}
+          </div>
+        </form>
+      </div></div>`, 'tplform');
+  }
+
+  function closeTemplateForm() {
+    const tf = S.tplForm;
+    S.tplForm = null;
+    if (S.pendingRefresh) setTimeout(doRefresh, 50);
+    if (!tf) return closeModal();
+    if (tf.mode === 'edit' && S.cd) return renderCardModal();
+    if (tf.mode === 'preview') return renderTplEditor();
+    closeModal();
+  }
+
+  function onTemplateFormInput(ev) {
+    const form = ev.target.closest('form[data-tplform]');
+    if (!form || !S.tplForm) return;
+    const el = ev.target;
+    if (el.name === '__title') { el.dataset.titleAuto = ''; return; }
+    if (ev.type === 'change' && el.type === 'checkbox' && el.checked) {
+      const group = $$(`input[name="${el.name}"]`, form);
+      if (el.dataset.excl) group.forEach((g) => { if (g !== el) g.checked = false; });
+      else group.forEach((g) => { if (g.dataset.excl) g.checked = false; });
+    }
+    $$('.tpl-field', form).forEach((fd) => {
+      const other = $('.other-input', fd);
+      if (!other) return;
+      const k = fd.dataset.key;
+      const on = $$(`[name="f_${k}"]`, form).some((i) => (i.tagName === 'SELECT' ? i.value === '__other__' : i.checked && i.value === '__other__'));
+      other.classList.toggle('hidden', !on);
+    });
+    const t = form.elements.__title;
+    if (t && t.dataset.titleAuto) t.value = suggestTitle(S.tplForm.tpl, collectAnswers(form, S.tplForm.tpl));
+  }
+  document.addEventListener('input', onTemplateFormInput);
+  document.addEventListener('change', onTemplateFormInput);
+
+  function validateAnswers(tpl, a) {
+    for (const f of tpl.fields) {
+      const v = a[f.key];
+      const empty = Array.isArray(v) ? !v.length : !v;
+      if (f.required && empty) return `Responda o campo obrigatório "${f.label}".`;
+      const vals = Array.isArray(v) ? v : [v];
+      if (vals.includes('__other__') && !a[f.key + '__other']) return `Descreva a opção "Outros" em "${f.label}".`;
+    }
+    return null;
+  }
+
+  function renderFormData(c) {
+    if (!c.form_data || !c.form_data.length) return '';
+    const tplExists = (S.templates || []).some((t) => t.id === c.template_id);
+    return `
+      <div class="cm-section">
+        <h4>${icon('form')} ${esc(c.template_name || 'Solicitação')}
+          ${canEdit() && !S.board.archived && tplExists ? '<button class="btn sm" data-act="edit-answers" style="margin-left:auto">Editar respostas</button>' : ''}</h4>
+        <div class="small muted" style="margin:-4px 0 8px">Solicitado por ${esc(userName(c.created_by))} em ${fmtDate(c.created_at)}</div>
+        <dl class="form-data">
+          ${c.form_data.map((d) => `<dt>${esc(d.label)}</dt><dd>${(d.values || []).length
+            ? (d.type === 'textarea' ? `<div style="white-space:pre-wrap">${linkify(d.values[0])}</div>`
+              : (d.values.length > 1 || d.type === 'checkbox') ? d.values.map((v) => `<span class="pill">${esc(v)}</span>`).join(' ')
+              : esc(d.type === 'date' ? fmtDate(d.values[0], false) : d.values[0]))
+            : '<span class="muted">Não informado</span>'}</dd>`).join('')}
+        </dl>
+      </div>`;
+  }
+  const formDataText = (c) => (c.form_data || []).map((d) => `${d.label}: ${(d.values || []).join(', ')}`).join('; ');
+
+  // ---------- Construtor de templates (Administração) ----------
+  function renderTemplatesAdmin() {
+    const list = S.admin.templates;
+    if (list === null) return `<section class="panel" style="margin-bottom:20px"><h2>${icon('form')} Templates de cartão</h2><div class="notice">Para usar templates, execute o arquivo <b>atualizacao-04-templates.sql</b> no SQL Editor do Supabase.</div></section>`;
+    const bmap = Object.fromEntries((S.admin.boards || []).map((b) => [b.id, b.title]));
+    return `
+      <section class="panel" style="margin-bottom:20px">
+        <h2>${icon('form')} Templates de cartão <span class="spacer"></span><button class="btn primary sm" data-act="tpl-new">${icon('plus', 14)} Novo template</button></h2>
+        <p class="small muted" style="margin:0 0 8px;line-height:1.5">Formulários que os membros usam ao adicionar um cartão. Leitores também podem criar cartões por template.</p>
+        ${list.length ? `<div class="table-wrap"><table class="table"><tbody>
+          ${list.map((t) => `
+            <tr>
+              <td><div style="font-weight:600">${esc(t.name)}</div><div class="small muted">${t.fields.length} pergunta(s) · ${t.all_boards ? 'todos os quadros' : (t.boards || []).length ? esc((t.boards || []).map((b) => bmap[b]).filter(Boolean).join(', ')) : '<b style="color:var(--danger)">nenhum quadro</b>'}</div></td>
+              <td style="width:110px"><label class="row small" style="cursor:pointer"><input type="checkbox" ${t.active ? 'checked' : ''} data-change="tpl-toggle" data-id="${t.id}"> Ativo</label></td>
+              <td style="text-align:right;white-space:nowrap">
+                <button class="btn sm" data-act="tpl-edit" data-id="${t.id}">Editar</button>
+                <button class="btn sm" data-act="tpl-dup" data-id="${t.id}">Duplicar</button>
+                <button class="btn sm" data-act="tpl-del" data-id="${t.id}">Excluir</button>
+              </td>
+            </tr>`).join('')}
+        </tbody></table></div>` : '<p class="empty">Nenhum template criado.</p>'}
+      </section>`;
+  }
+
+  const blankField = () => ({ key: '', label: '', type: 'radio', required: true, help: '', allow_other: false, priority: false, options: [{ label: '' }, { label: '' }] });
+
+  function renderTplEditor() {
+    const t = S.tplEdit;
+    const boards = (S.admin.boards || []).slice().sort((a, b) => (a.archived - b.archived) || a.title.localeCompare(b.title));
+    const fieldHtml = t.fields.map((f, i) => {
+      const choice = CHOICE(f.type);
+      const prio = f.priority && (f.type === 'radio' || f.type === 'select');
+      return `
+        <div class="tpl-q">
+          <div class="row wrap" style="gap:8px;align-items:flex-end">
+            <span class="tpl-num">${i + 1}</span>
+            <label class="field" style="flex:2 1 260px;margin:0"><span>Pergunta</span><input class="input" value="${esc(f.label)}" data-tf="fields.${i}.label" maxlength="120" placeholder="Ex.: Período de análise"></label>
+            <label class="field" style="flex:1 1 200px;margin:0"><span>Tipo</span><select class="select" data-tf="fields.${i}.type" data-rerender="1">
+              ${Object.entries(FIELD_TYPES).map(([k, v]) => `<option value="${k}" ${f.type === k ? 'selected' : ''}>${v}</option>`).join('')}</select></label>
+            <div class="row" style="gap:2px">
+              <button type="button" class="icon-btn" data-act="tpl-move" data-i="${i}" data-dir="-1" title="Subir" ${i === 0 ? 'disabled' : ''}>${icon('up')}</button>
+              <button type="button" class="icon-btn" data-act="tpl-move" data-i="${i}" data-dir="1" title="Descer" ${i === t.fields.length - 1 ? 'disabled' : ''}>${icon('down')}</button>
+              <button type="button" class="icon-btn" data-act="tpl-del-field" data-i="${i}" title="Remover pergunta">${icon('trash')}</button>
+            </div>
+          </div>
+          <label class="field" style="margin:10px 0 8px"><span>Texto de ajuda (opcional)</span><input class="input" value="${esc(f.help || '')}" data-tf="fields.${i}.help" maxlength="200"></label>
+          <div class="row wrap" style="gap:16px;margin-bottom:${choice ? 10 : 0}px">
+            <label class="row small" style="cursor:pointer"><input type="checkbox" ${f.required ? 'checked' : ''} data-tf="fields.${i}.required" data-tf-type="bool"> Obrigatória</label>
+            ${choice ? `<label class="row small" style="cursor:pointer"><input type="checkbox" ${f.allow_other ? 'checked' : ''} data-tf="fields.${i}.allow_other" data-tf-type="bool"> Incluir "Outros" com campo aberto</label>` : ''}
+            ${f.type === 'radio' || f.type === 'select' ? `<label class="row small" style="cursor:pointer"><input type="checkbox" ${f.priority ? 'checked' : ''} data-tf="fields.${i}.priority" data-tf-type="bool" data-rerender="1"> Esta pergunta define a prioridade (prazo e etiqueta)</label>` : ''}
+          </div>
+          ${choice ? `
+            <div class="small" style="font-weight:600;color:var(--ink-2);margin-bottom:6px">Opções</div>
+            ${prio ? '<div class="small muted" style="margin-bottom:6px">Prazo em horas corridas a partir da criação do cartão (deixe vazio para "sem prazo"). A etiqueta é criada no quadro automaticamente.</div>' : ''}
+            ${(f.options || []).map((o, j) => `
+              <div class="row wrap tpl-opt">
+                <input class="input" style="flex:2 1 200px" value="${esc(o.label)}" data-tf="fields.${i}.options.${j}.label" maxlength="120" placeholder="Opção ${j + 1}">
+                ${f.type === 'checkbox' ? `<label class="row small" style="cursor:pointer" title="Ao marcar esta opção, as demais são desmarcadas (ex.: Todas)"><input type="checkbox" ${o.exclusive ? 'checked' : ''} data-tf="fields.${i}.options.${j}.exclusive" data-tf-type="bool"> Exclusiva</label>` : ''}
+                ${prio ? `
+                  <input class="input" type="number" min="0" step="1" style="width:110px" value="${o.due_hours ?? ''}" data-tf="fields.${i}.options.${j}.due_hours" data-tf-type="num" placeholder="Horas">
+                  <input class="input" style="flex:1 1 160px" value="${esc(o.tag_name || '')}" data-tf="fields.${i}.options.${j}.tag_name" maxlength="40" placeholder="Etiqueta (opcional)">
+                  <input type="color" value="${safeColor(o.tag_color, '#64748b')}" data-tf="fields.${i}.options.${j}.tag_color" title="Cor da etiqueta">` : ''}
+                <button type="button" class="icon-btn" data-act="tpl-del-opt" data-i="${i}" data-j="${j}" title="Remover opção">${icon('x', 14)}</button>
+              </div>`).join('')}
+            <button type="button" class="btn sm" data-act="tpl-add-opt" data-i="${i}">${icon('plus', 14)} Adicionar opção</button>` : ''}
+        </div>`;
+    }).join('');
+    const scroll = $('#modal-root .overlay') ? $('#modal-root .overlay').scrollTop : 0;
+    openModal(`
+      <div class="modal wide"><button class="icon-btn modal-close" data-act="tpl-cancel">${icon('x')}</button>
+      <div class="modal-body">
+        <h3>${t.id ? 'Editar template' : 'Novo template'}</h3>
+        <form data-submit="tpl-save">
+          <div class="row wrap" style="gap:12px;align-items:flex-start">
+            <label class="field" style="flex:1 1 260px"><span>Nome do template</span><input class="input" value="${esc(t.name)}" data-tf="name" maxlength="80" required placeholder="Ex.: Solicitação de relatório"></label>
+            <label class="field" style="flex:2 1 320px"><span>Descrição (aparece no topo do formulário)</span><input class="input" value="${esc(t.description)}" data-tf="description" maxlength="300"></label>
+          </div>
+          <div class="field"><span>Título sugerido do cartão</span>
+            <div class="row wrap" style="gap:8px">
+              <input class="input" style="flex:1 1 320px" value="${esc(t.title_pattern)}" data-tf="title_pattern" maxlength="200" placeholder="Ex.: Relatório: {assunto} | {periodo}">
+              <select class="select" style="width:auto" data-change="tpl-insert-key"><option value="">Inserir resposta de...</option>
+                ${t.fields.map((f, i) => `<option value="${i}">${esc(f.label || `Pergunta ${i + 1}`)}</option>`).join('')}</select>
+            </div>
+            <div class="small muted" style="margin-top:4px">Os trechos entre chaves são trocados pelas respostas. A pessoa pode ajustar o título antes de criar.</div>
+          </div>
+          <div class="field"><span>Disponível nos quadros</span>
+            <label class="row" style="cursor:pointer;margin-bottom:6px"><input type="checkbox" ${t.all_boards ? 'checked' : ''} data-tf="all_boards" data-tf-type="bool" data-rerender="1"> Todos os quadros (inclusive os criados no futuro)</label>
+            ${t.all_boards ? '' : `<div class="opt-grid">${boards.map((b) => `<label class="opt-check"><input type="checkbox" data-board-pick="${b.id}" ${(t.boards || []).includes(b.id) ? 'checked' : ''}> <span>${esc(b.title)}${b.archived ? ' (arquivado)' : ''}</span></label>`).join('')}</div>`}
+          </div>
+          <label class="row" style="cursor:pointer;margin-bottom:16px"><input type="checkbox" ${t.active ? 'checked' : ''} data-tf="active" data-tf-type="bool"> Ativo (aparece para os membros)</label>
+          <h4 style="margin:8px 0 10px;font-size:15px">Perguntas</h4>
+          ${fieldHtml || '<p class="empty">Nenhuma pergunta ainda.</p>'}
+          <button type="button" class="btn" data-act="tpl-add-field" style="margin:4px 0 20px">${icon('plus', 14)} Adicionar pergunta</button>
+          <div class="row wrap">
+            <button class="btn primary" type="submit">Salvar template</button>
+            <button class="btn" type="button" data-act="tpl-preview">${icon('eye', 14)} Pré-visualizar</button>
+            <button class="btn" type="button" data-act="tpl-cancel">Cancelar</button>
+          </div>
+        </form>
+      </div></div>`, 'locked');
+    const ov = $('#modal-root .overlay');
+    if (ov) ov.scrollTop = scroll;
+  }
+
+  function setPath(obj, path, val) {
+    const parts = path.split('.');
+    let o = obj;
+    for (let i = 0; i < parts.length - 1; i++) o = o[/^\d+$/.test(parts[i]) ? Number(parts[i]) : parts[i]];
+    const last = parts[parts.length - 1];
+    if (val === undefined) delete o[last]; else o[last] = val;
+  }
+  function onTplEditInput(ev) {
+    const el = ev.target;
+    if (!S.tplEdit) return;
+    if (el.dataset.boardPick && ev.type === 'change') {
+      const set = new Set(S.tplEdit.boards || []);
+      if (el.checked) set.add(el.dataset.boardPick); else set.delete(el.dataset.boardPick);
+      S.tplEdit.boards = [...set];
+      return;
+    }
+    if (!el.dataset.tf) return;
+    const kind = el.dataset.tfType;
+    let val = kind === 'bool' ? el.checked : el.value;
+    if (kind === 'num') val = el.value === '' ? undefined : Math.max(0, Number(el.value));
+    setPath(S.tplEdit, el.dataset.tf, val);
+    if (el.dataset.rerender && ev.type === 'change') {
+      S.tplEdit.fields.forEach((f) => {
+        if (CHOICE(f.type) && !(f.options && f.options.length)) f.options = [{ label: '' }, { label: '' }];
+        if (!(f.type === 'radio' || f.type === 'select')) f.priority = false;
+      });
+      const pr = S.tplEdit.fields.filter((f) => f.priority);
+      if (pr.length > 1 && el.checked) pr.forEach((f, i) => { if (`fields.${S.tplEdit.fields.indexOf(f)}.priority` !== el.dataset.tf) f.priority = false; });
+      renderTplEditor();
+    }
+  }
+  document.addEventListener('input', onTplEditInput);
+  document.addEventListener('change', onTplEditInput);
+
+  function cleanTemplate(t) {
+    ensureKeys(t);
+    const fields = t.fields.map((f) => {
+      const out = { key: f.key, label: f.label.trim(), type: f.type, required: !!f.required };
+      if (f.help && f.help.trim()) out.help = f.help.trim();
+      if (CHOICE(f.type)) {
+        out.options = (f.options || []).filter((o) => o.label && o.label.trim()).map((o) => {
+          const x = { label: o.label.trim() };
+          if (f.type === 'checkbox' && o.exclusive) x.exclusive = true;
+          if (f.priority) {
+            if (o.due_hours !== undefined && o.due_hours !== '' && !isNaN(o.due_hours)) x.due_hours = Number(o.due_hours);
+            if (o.tag_name && o.tag_name.trim()) { x.tag_name = o.tag_name.trim(); x.tag_color = safeColor(o.tag_color, '#64748b'); }
+          }
+          return x;
+        });
+        if (f.allow_other) out.allow_other = true;
+        if (f.priority && (f.type === 'radio' || f.type === 'select')) out.priority = true;
+      }
+      return out;
+    });
+    return { name: t.name.trim(), description: (t.description || '').trim(), title_pattern: (t.title_pattern || '').trim(),
+      fields, all_boards: !!t.all_boards, boards: t.all_boards ? [] : (t.boards || []), active: !!t.active };
+  }
+  function templateProblem(t) {
+    if (!t.name) return 'Informe o nome do template.';
+    if (!t.fields.length) return 'Adicione pelo menos uma pergunta.';
+    for (const [i, f] of t.fields.entries()) {
+      if (!f.label) return `A pergunta ${i + 1} está sem texto.`;
+      if (CHOICE(f.type) && !f.options.length) return `A pergunta "${f.label}" precisa de pelo menos uma opção.`;
+      if (CHOICE(f.type) && new Set(f.options.map((o) => o.label)).size !== f.options.length) return `A pergunta "${f.label}" tem opções repetidas.`;
+    }
+    if (!t.all_boards && !t.boards.length && t.active) return 'Escolha em quais quadros o template fica disponível (ou marque "Todos os quadros").';
+    return null;
+  }
+
+  // ------------------------------------------------------------------------
   // Exportação CSV
   // ------------------------------------------------------------------------
   async function exportCsv() {
@@ -1805,7 +2205,7 @@
     const lord = Object.fromEntries(S.lists.map((l, i) => [l.id, i]));
     cards.sort((a, b) => (lord[a.list_id] - lord[b.list_id]) || (a.position - b.position));
     const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-    const head = ['Lista', 'Cartão', 'Descrição', 'Etiquetas', 'Responsáveis', 'Início', 'Entrega', 'Situação', 'Checklist', 'Anexos', 'Arquivado', 'Criado por', 'Criado em', 'Atualizado em'];
+    const head = ['Lista', 'Cartão', 'Descrição', 'Etiquetas', 'Responsáveis', 'Início', 'Entrega', 'Situação', 'Checklist', 'Anexos', 'Template', 'Respostas da solicitação', 'Arquivado', 'Criado por', 'Criado em', 'Atualizado em'];
     const rows = cards.map((c) => {
       const s = S.stats[c.id] || {};
       const st = dueStatus(c);
@@ -1819,13 +2219,16 @@
         c.completed ? 'Concluído' : st === 'overdue' ? 'Atrasado' : 'Em aberto',
         s.items_total ? `${s.items_done}/${s.items_total}` : '',
         s.attachments || '',
+        c.template_name || '',
+        formDataText(c),
         c.archived ? 'Sim' : 'Não',
         userName(c.created_by),
         new Date(c.created_at).toLocaleString('pt-BR'),
         new Date(c.updated_at).toLocaleString('pt-BR')
       ].map(cell).join(';');
     });
-    const csv = '﻿' + [head.map(cell).join(';'), ...rows].join('\r\n');
+    const csv = '\ufeff' + [head.map(cell).join(';'), ...rows].join('\r\n');
+    if (demoHook('onDownload', `${S.board.title}.csv`, csv)) return;
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
     const d = new Date();
@@ -1843,7 +2246,13 @@
     // acesso
     'auth-mode': (el) => { S.authMode = el.dataset.mode; S.authMsg = null; renderAuth(); },
     recheck: async () => { await loadMe(); route(); },
-    logout: async () => { closePopover(); await sb.auth.signOut(); location.hash = '#/'; },
+    logout: async () => {
+      closePopover(); closeModal(); cleanupBoard();
+      S.session = null; S.me = null; S.profiles = {}; S.admin = null; S.authMsg = null;
+      renderAuth();
+      try { history.replaceState(null, '', location.pathname + location.search + '#/'); } catch (e) { /* ignora */ }
+      await sb.auth.signOut();
+    },
     'user-menu': (el) => openPopover(el, S.me.full_name, () => `
       <p class="small muted" style="text-align:center;margin:-6px 0 10px">${esc(S.me.email)}</p>
       <button class="opt" data-act="edit-profile">${icon('user')} Meu perfil</button>
@@ -1854,7 +2263,7 @@
 
     // genéricos
     'close-modal': () => closeModal(),
-    overlay: (el, ev) => { if (ev.target === el && el.dataset.kind !== 'locked') { if (el.dataset.kind === 'card') closeCard(); else closeModal(); } },
+    overlay: (el, ev) => { if (ev.target === el && el.dataset.kind === 'tplform') return closeTemplateForm(); if (ev.target === el && el.dataset.kind !== 'locked') { if (el.dataset.kind === 'card') closeCard(); else closeModal(); } },
     'pop-close': () => closePopover(),
     'pick-swatch': (el) => {
       const form = el.closest('form');
@@ -1884,8 +2293,59 @@
       if (fit < ZOOM_STEPS[0]) toast('O quadro tem listas demais para caber inteiro; ajustado ao menor zoom (50%).');
     },
     'toggle-filters': () => { S.showFilters = !S.showFilters; renderBoard(); },
-    'clear-filters': () => { S.filters = { q: '', member: '', label: '', due: '' }; renderBoard(); },
-    'add-card': (el) => { S.addingCardTo = el.dataset.list; renderBoard(); },
+    'clear-filters': () => { S.filters = { q: '', member: '', label: '', due: '', template: '' }; renderBoard(); },
+    'add-card': (el) => {
+      const tpls = canUseTemplates() ? boardTemplates() : [];
+      if (!tpls.length) { S.addingCardTo = el.dataset.list; return renderBoard(); }
+      if (!canEdit() && tpls.length === 1) return openTemplateForm(tpls[0], { mode: 'new', listId: el.dataset.list });
+      openPopover(el, canEdit() ? 'Adicionar cartão' : 'Nova solicitação', () => `
+        ${canEdit() ? `<button class="opt" data-act="add-card-plain" data-list="${el.dataset.list}">${icon('card')}<span style="flex:1"><b>Cartão padrão</b><div class="small muted">Só o título; o resto você preenche depois</div></span></button>
+        <div class="small muted" style="margin:10px 8px 4px;font-weight:600">Usar um template</div>` : ''}
+        ${tpls.map((t) => `<button class="opt" data-act="use-template" data-id="${t.id}" data-list="${el.dataset.list}">${icon('form')}<span style="flex:1"><b>${esc(t.name)}</b>${t.description ? `<div class="small muted">${esc(t.description)}</div>` : ''}</span></button>`).join('')}`);
+    },
+    'add-card-plain': (el) => { closePopover(); S.addingCardTo = el.dataset.list; renderBoard(); },
+    'use-template': (el) => { const t = (S.templates || []).find((x) => x.id === el.dataset.id); closePopover(); if (t) openTemplateForm(t, { mode: 'new', listId: el.dataset.list }); },
+    'close-tplform': () => closeTemplateForm(),
+    'edit-answers': () => {
+      const t = (S.templates || []).find((x) => x.id === S.cd.card.template_id);
+      if (t) openTemplateForm(t, { mode: 'edit', card: S.cd.card });
+    },
+    'tpl-new': () => { S.tplEdit = { name: '', description: '', title_pattern: '', fields: [blankField()], all_boards: false, boards: [], active: true }; renderTplEditor(); },
+    'tpl-edit': (el) => { const t = S.admin.templates.find((x) => x.id === el.dataset.id); S.tplEdit = JSON.parse(JSON.stringify(t)); renderTplEditor(); },
+    'tpl-dup': (el) => {
+      const t = JSON.parse(JSON.stringify(S.admin.templates.find((x) => x.id === el.dataset.id)));
+      delete t.id; t.name = t.name + ' (cópia)'; t.active = false;
+      S.tplEdit = t; renderTplEditor();
+    },
+    'tpl-del': async (el) => {
+      const t = S.admin.templates.find((x) => x.id === el.dataset.id);
+      if (!(await confirmDialog(`Excluir o template <b>${esc(t.name)}</b>? Os cartões já criados com ele mantêm as respostas, mas não poderão mais ter as respostas editadas. Para apenas esconder, desmarque "Ativo".`, { confirmText: 'Excluir', danger: true }))) return;
+      await q(sb.from('card_templates').delete().eq('id', t.id));
+      toast('Template excluído.');
+      await showAdmin();
+    },
+    'tpl-cancel': async () => {
+      if (!(await confirmDialog('Sair sem salvar as alterações do template?', { confirmText: 'Sair sem salvar' }))) return;
+      S.tplEdit = null; closeModal();
+    },
+    'tpl-add-field': () => { S.tplEdit.fields.push(blankField()); renderTplEditor(); const ov = $('#modal-root .overlay'); if (ov) ov.scrollTop = ov.scrollHeight; },
+    'tpl-del-field': async (el) => {
+      const f = S.tplEdit.fields[Number(el.dataset.i)];
+      if (f.label && !(await confirmDialog(`Remover a pergunta <b>${esc(f.label)}</b>?`, { confirmText: 'Remover', danger: true }))) return;
+      S.tplEdit.fields.splice(Number(el.dataset.i), 1); renderTplEditor();
+    },
+    'tpl-move': (el) => {
+      const i = Number(el.dataset.i), j = i + Number(el.dataset.dir), F = S.tplEdit.fields;
+      if (j < 0 || j >= F.length) return;
+      [F[i], F[j]] = [F[j], F[i]]; renderTplEditor();
+    },
+    'tpl-add-opt': (el) => { S.tplEdit.fields[Number(el.dataset.i)].options.push({ label: '' }); renderTplEditor(); },
+    'tpl-del-opt': (el) => { S.tplEdit.fields[Number(el.dataset.i)].options.splice(Number(el.dataset.j), 1); renderTplEditor(); },
+    'tpl-preview': () => {
+      const t = cleanTemplate(JSON.parse(JSON.stringify(S.tplEdit)));
+      if (!t.fields.length) return toast('Adicione pelo menos uma pergunta.', true);
+      openTemplateForm(t, { mode: 'preview' });
+    },
     'cancel-add-card': () => { S.addingCardTo = null; renderBoard(); },
     'add-list': () => { S.addingList = true; renderBoard(); },
     'cancel-add-list': () => { S.addingList = false; renderBoard(); },
@@ -1992,6 +2452,7 @@
       const a = S.cd.attachments.find((x) => x.id === el.dataset.id);
       if (!a) return;
       if (!isPreviewable(a)) return A['download-att'](el);
+      if (CFG.onOpenFile) { const r = await bucket().createSignedUrl(a.storage_path, 300); if (r.error) throw r.error; return demoHook('onOpenFile', a, r.data.signedUrl); }
       const w = window.open('', '_blank');
       const { data, error } = await bucket().createSignedUrl(a.storage_path, 300);
       if (error) { if (w) w.close(); throw error; }
@@ -2002,6 +2463,7 @@
       if (!a) return;
       const { data, error } = await bucket().createSignedUrl(a.storage_path, 300, { download: a.file_name });
       if (error) throw error;
+      if (demoHook('onOpenFile', a, data.signedUrl, true)) return;
       const link = document.createElement('a');
       link.href = data.signedUrl; link.rel = 'noopener';
       document.body.appendChild(link); link.click(); link.remove();
@@ -2138,7 +2600,8 @@
     login: async (f) => {
       const btn = f.querySelector('[type=submit]'); btn.disabled = true;
       try {
-        const { error } = await sb.auth.signInWithPassword({ email: f.email.value.trim(), password: f.password.value });
+        S.authEmail = f.email.value.trim();
+        const { error } = await sb.auth.signInWithPassword({ email: S.authEmail, password: f.password.value });
         if (error) throw error;
         S.authMsg = null;
       } catch (e) { S.authMsg = { type: 'err', text: errMsg(e) }; renderAuth(); }
@@ -2365,6 +2828,38 @@
       toast('Senha criada. Bem-vindo(a)!');
       route();
     },
+    'tpl-form': async (f) => {
+      const tf = S.tplForm;
+      if (!tf || tf.mode === 'preview') return;
+      const a = collectAnswers(f, tf.tpl);
+      const problem = validateAnswers(tf.tpl, a);
+      if (problem) return toast(problem, true);
+      if (tf.mode === 'edit') {
+        await q(sb.rpc('update_card_answers', { p_card: tf.card.id, p_answers: a }));
+        S.tplForm = null;
+        toast('Respostas atualizadas.');
+        return afterCardChange();
+      }
+      const title = f.__title.value.trim();
+      if (!title) return toast('Informe o título do cartão.', true);
+      const cardId = await q(sb.rpc('create_card_from_template', { p_list: f.__list.value, p_template: tf.tpl.id, p_title: title, p_answers: a }));
+      S.tplForm = null;
+      closeModal();
+      toast('Cartão criado.');
+      await refreshBoard();
+      if (cardId) go(`#/b/${S.board.id}/c/${cardId}`);
+    },
+    'tpl-save': async () => {
+      const t = cleanTemplate(JSON.parse(JSON.stringify(S.tplEdit)));
+      const problem = templateProblem(t);
+      if (problem) return toast(problem, true);
+      if (S.tplEdit.id) await q(sb.from('card_templates').update(t).eq('id', S.tplEdit.id));
+      else await q(sb.from('card_templates').insert(t));
+      S.tplEdit = null;
+      closeModal();
+      toast('Template salvo.');
+      await showAdmin();
+    },
     'admin-config': async (f) => {
       const dom = f.allowed_domain.value.trim().replace(/^@/, '').toLowerCase() || null;
       await q(sb.from('app_config').update({ allowed_domain: dom, require_approval: f.require_approval.checked, updated_at: new Date().toISOString() }).eq('id', 1));
@@ -2395,6 +2890,17 @@
       const position = nextCardPos(el.value);
       await q(sb.from('cards').update({ list_id: el.value, position }).eq('id', S.cd.card.id));
       await afterCardChange();
+    },
+    'tpl-toggle': async (el) => {
+      try { await q(sb.from('card_templates').update({ active: el.checked }).eq('id', el.dataset.id)); toast(el.checked ? 'Template ativado.' : 'Template desativado.'); }
+      finally { await showAdmin(); }
+    },
+    'tpl-insert-key': (el) => {
+      if (el.value === '') return;
+      ensureKeys(S.tplEdit);
+      const f = S.tplEdit.fields[Number(el.value)];
+      S.tplEdit.title_pattern = ((S.tplEdit.title_pattern || '').trim() + (S.tplEdit.title_pattern ? ' | ' : '') + `{${f.key}}`).trim();
+      renderTplEditor();
     },
     'att-files': async (el) => { const files = Array.from(el.files || []); el.value = ''; await uploadFiles(files); },
     'toggle-complete': async (el) => {
@@ -2540,6 +3046,7 @@
     if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey) && el.hasAttribute && el.hasAttribute('data-ctrl-submit')) {
       ev.preventDefault(); el.closest('form').requestSubmit(); return;
     }
+    if (ev.key === 'Escape' && S.tplForm && !S.pop && !document.querySelector('body > .overlay')) { ev.preventDefault(); closeTemplateForm(); return; }
     if (ev.key === 'Escape') {
       if (S.pop) return closePopover();
       if (el.hasAttribute && el.hasAttribute('data-blur-submit')) {
