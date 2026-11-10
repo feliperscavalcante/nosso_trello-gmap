@@ -346,3 +346,9 @@ a { color: var(--primary); }
 .cards .card-ghost:not(.sortable-fallback) { opacity: 1; transform: none; background: #091e421f; box-shadow: none; }
 .cards .card-ghost:not(.sortable-fallback) > * { visibility: hidden; }
 .lists .list.card-ghost:not(.sortable-fallback) { opacity: .5; transform: none; }
+
+/* ---------- Cadastro de usuários ---------- */
+.choice { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px; cursor: pointer; line-height: 1.45; }
+.choice:has(input:checked) { border-color: var(--primary); background: #e9f2ff; }
+.choice input { margin-top: 3px; flex: none; }
+.temp-pass { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 20px; font-weight: 700; letter-spacing: 1px; background: var(--bg); padding: 8px 12px; border-radius: 6px; flex: 1; text-align: center; user-select: all; }

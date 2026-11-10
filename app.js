@@ -63,6 +63,7 @@
       [/rate limit|too many/i, 'Muitas tentativas seguidas. Aguarde alguns minutos.'],
       [/Failed to fetch|NetworkError/i, 'Sem conexão com o servidor. Verifique sua internet.'],
       [/JWT expired/i, 'Sua sessão expirou. Entre novamente.'],
+      [/should be different from the old password/i, 'A nova senha precisa ser diferente da senha provisória.'],
       [/Bucket not found/i, 'O armazenamento de anexos ainda não foi ativado. Execute o arquivo atualizacao-02-anexos.sql no Supabase.'],
       [/mime type .* is not supported|invalid mime/i, 'Tipo de arquivo não permitido.'],
       [/exceeded the maximum allowed size|Payload too large/i, 'O arquivo passa do limite de 10 MB.']
@@ -211,6 +212,7 @@
     if (!configured) return renderNotConfigured();
     if (!S.session) { cleanupBoard(); return renderAuth(); }
     if (!S.me || S.me.status !== 'active') { cleanupBoard(); return renderPending(); }
+    if (S.me.must_change_password && !S.recovery) { cleanupBoard(); closeModal(); return renderForceChange(); }
     const parts = location.hash.replace(/^#\/?/, '').split('/');
     try {
       if (parts[0] === 'b' && parts[1]) return await showBoard(parts[1], parts[2] === 'c' ? parts[3] : null);
@@ -249,7 +251,9 @@
           <label class="field"><span>E-mail</span><input class="input" type="email" name="email" required autocomplete="email" data-autofocus></label>
           <label class="field"><span>Senha</span><input class="input" type="password" name="password" required autocomplete="current-password"></label>
           <button class="btn primary" style="width:100%" type="submit">Entrar</button>
-          <p class="small" style="text-align:center;margin:14px 0 0"><a href="#" data-act="auth-mode" data-mode="forgot">Esqueci minha senha</a></p>
+          ${CFG.EMAIL_ENABLED
+            ? '<p class="small" style="text-align:center;margin:14px 0 0"><a href="#" data-act="auth-mode" data-mode="forgot">Esqueci minha senha</a></p>'
+            : '<p class="small muted" style="text-align:center;margin:14px 0 0;line-height:1.5">Esqueceu a senha? Peça ao administrador do sistema para redefinir.</p>'}
         </form>`;
     } else if (m === 'signup') {
       form = `
@@ -1275,7 +1279,10 @@
     const boards = await q(sb.from('boards').select('id,title,archived'));
     const us = await sb.rpc('attachments_usage');
     const usage = us.error ? null : (Array.isArray(us.data) ? us.data[0] : us.data);
-    S.admin = { cfg: cfg || {}, boards, usage };
+    const limit = (S.admin && S.admin.auditLimit) || 30;
+    const pr = await sb.from('pre_registrations').select('*').is('used_at', null).order('created_at', { ascending: false });
+    const au = await sb.from('admin_audit').select('*').order('created_at', { ascending: false }).limit(limit);
+    S.admin = { cfg: cfg || {}, boards, usage, prereg: pr.error ? null : pr.data, audit: au.error ? null : au.data, auditLimit: limit };
     renderAdmin();
   }
 
@@ -1308,24 +1315,30 @@
         ${pend ? `<div class="notice">Há <b>${pend}</b> cadastro(s) aguardando aprovação.</div>` : ''}
         ${renderUsage()}
         <section class="panel" style="margin-bottom:20px">
-          <h2>${icon('users')} Usuários (${users.length})</h2>
+          <h2>${icon('users')} Usuários (${users.length})
+            <span class="spacer"></span>
+            ${S.admin.prereg === null ? '' : `<button class="btn primary sm" data-act="new-user">${icon('plus', 14)} Novo usuário</button>`}</h2>
+          ${S.admin.prereg === null ? '<div class="notice">Para cadastrar usuários por aqui, execute o arquivo <b>atualizacao-03-usuarios.sql</b> no SQL Editor do Supabase.</div>' : ''}
           <div class="table-wrap"><table class="table">
             <thead><tr><th>Servidor</th><th>Situação</th><th>Admin</th><th class="hide-sm">Cadastro</th><th style="text-align:right">Ações</th></tr></thead>
             <tbody>${users.map((u) => `
               <tr>
                 <td><div class="row">${avatar(u.id)}<div style="min-width:0"><div style="font-weight:600">${esc(u.full_name)}${u.id === S.me.id ? ' <span class="muted small">(você)</span>' : ''}</div><div class="small muted">${esc(u.email)}</div></div></div></td>
-                <td><span class="status ${u.status}">${statusName[u.status]}</span></td>
+                <td><span class="status ${u.status}">${statusName[u.status]}</span>${u.must_change_password ? '<div class="small muted" style="margin-top:4px">Senha provisória</div>' : ''}</td>
                 <td><input type="checkbox" ${u.is_admin ? 'checked' : ''} data-change="admin-toggle" data-id="${u.id}" title="Administrador do sistema"></td>
                 <td class="hide-sm small muted">${fmtDate(u.created_at, false)}</td>
                 <td style="text-align:right;white-space:nowrap">
                   ${u.status === 'pending' ? `<button class="btn primary sm" data-act="user-status" data-id="${u.id}" data-status="active">Aprovar</button> <button class="btn sm" data-act="user-status" data-id="${u.id}" data-status="inactive">Recusar</button>` : ''}
                   ${u.status === 'active' && u.id !== S.me.id ? `<button class="btn sm" data-act="user-status" data-id="${u.id}" data-status="inactive">Desativar</button>` : ''}
                   ${u.status === 'inactive' ? `<button class="btn sm" data-act="user-status" data-id="${u.id}" data-status="active">Reativar</button>` : ''}
+                  ${u.status !== 'pending' && u.id !== S.me.id && S.admin.prereg !== null ? `<button class="btn sm" data-act="reset-password" data-id="${u.id}" title="Gerar uma senha provisória nova">Redefinir senha</button>` : ''}
                 </td>
               </tr>`).join('')}</tbody>
           </table></div>
           <p class="small muted" style="line-height:1.5;margin-bottom:0">Desativar bloqueia o acesso imediatamente, mas preserva o histórico do servidor. Administradores enxergam e gerenciam todos os quadros.</p>
+          ${renderPreRegs()}
         </section>
+        ${renderAudit()}
         <section class="panel" style="margin-bottom:20px">
           <h2>${icon('board')} Importar do Trello</h2>
           ${renderImport()}
@@ -1637,6 +1650,152 @@
   }
 
   // ------------------------------------------------------------------------
+  // Cadastro de usuários pelo administrador
+  // ------------------------------------------------------------------------
+  async function invokeAdmin(body) {
+    const { data, error } = await sb.functions.invoke('admin-users', { body });
+    if (error) {
+      let msg = error.message || 'Falha ao chamar a função do servidor.';
+      try {
+        if (error.context && typeof error.context.json === 'function') {
+          const b = await error.context.json();
+          if (b && (b.error || b.message || b.msg)) msg = b.error || b.message || b.msg;
+        }
+      } catch (e) { /* mantém a mensagem original */ }
+      if (/invalid jwt|jwt/i.test(msg) && !/Sessão/.test(msg)) {
+        msg = 'O Supabase recusou a chamada da função (JWT). No painel do Supabase, abra Edge Functions > admin-users > Settings, desligue a opção "Verify JWT" e salve. A própria função já confere se quem chama é administrador.';
+      } else if (/not found|404|Failed to send a request|FunctionsFetchError|FunctionsRelayError/i.test(msg)) {
+        msg = 'A função "admin-users" ainda não foi criada no Supabase. Siga o passo a passo do guia (Edge Function) ou use a opção "Pré-cadastro", que não depende dela.';
+      }
+      throw new Error(msg);
+    }
+    if (data && data.error) throw new Error(data.error);
+    return data;
+  }
+
+  const AUDIT_TEXT = {
+    user_created: (t) => `criou a conta de ${t} com senha provisória`,
+    pre_registration_created: (t) => `fez o pré-cadastro de ${t}`,
+    pre_registration_cancelled: (t) => `cancelou o pré-cadastro de ${t}`,
+    pre_registration_used: (t) => `teve o pré-cadastro de ${t} utilizado (a pessoa criou a própria senha)`,
+    password_reset: (t) => `redefiniu a senha de ${t}`,
+    password_changed: () => 'trocou a senha provisória pela própria senha',
+    user_status: (t, d) => `alterou a situação de ${t} de ${esc(STATUS_NAME[d.from] || d.from)} para <b>${esc(STATUS_NAME[d.to] || d.to)}</b>`,
+    user_admin: (t, d) => (d.to ? `tornou ${t} administrador do sistema` : `retirou de ${t} o perfil de administrador`)
+  };
+  const STATUS_NAME = { pending: 'Pendente', active: 'Ativo', inactive: 'Inativo' };
+
+  function auditLine(a) {
+    const p = a.target_id && S.profiles[a.target_id];
+    const t = `<b>${esc(p ? p.full_name : (a.details && a.details.name) || a.target_email || 'usuário')}</b>`;
+    const fn = AUDIT_TEXT[a.action];
+    return `
+      <div class="feed-item act">
+        ${a.actor_id && S.profiles[a.actor_id] ? avatar(a.actor_id, 'sm') : `<span class="avatar sm" style="background:#8590a2">${esc(initials(a.actor_name || 'Sistema'))}</span>`}
+        <div class="txt"><span class="who">${esc(a.actor_name || 'Sistema')}</span> ${fn ? fn(t, a.details || {}) : esc(a.action)}
+          <div class="when">${fmtDate(a.created_at)} · ${relTime(a.created_at)}</div></div>
+      </div>`;
+  }
+
+  function renderPreRegs() {
+    const list = S.admin.prereg;
+    if (list === null) return '';
+    const open = list.filter((r) => !r.used_at && !r.temp_password);
+    if (!open.length) return '';
+    return `
+      <h4 style="margin:20px 0 8px;font-size:14px">Pré-cadastros aguardando a pessoa criar a conta (${open.length})</h4>
+      <div class="table-wrap"><table class="table"><tbody>
+        ${open.map((r) => `
+          <tr>
+            <td><div style="font-weight:600">${esc(r.full_name)}</div><div class="small muted">${esc(r.email)}</div></td>
+            <td class="small muted hide-sm">${r.boards.length} quadro(s)${r.is_admin ? ' · administrador' : ''}</td>
+            <td class="small muted hide-sm">${fmtDate(r.created_at, false)}</td>
+            <td style="text-align:right"><button class="btn sm" data-act="cancel-prereg" data-id="${r.id}">Cancelar</button></td>
+          </tr>`).join('')}
+      </tbody></table></div>`;
+  }
+
+  function renderAudit() {
+    const list = S.admin.audit;
+    if (list === null) return '';
+    return `
+      <section class="panel" style="margin-bottom:20px">
+        <h2>${icon('history')} Histórico de administração</h2>
+        ${list.length ? list.map(auditLine).join('') : '<p class="empty">Nenhuma ação registrada ainda.</p>'}
+        ${list.length >= S.admin.auditLimit ? '<button class="btn block" style="justify-content:center" data-act="more-audit">Carregar mais</button>' : ''}
+      </section>`;
+  }
+
+  function openNewUserModal() {
+    const boards = (S.admin.boards || []).slice().sort((a, b) => (a.archived - b.archived) || a.title.localeCompare(b.title));
+    openModal(`
+      <div class="modal"><button class="icon-btn modal-close" data-act="close-modal">${icon('x')}</button>
+      <div class="modal-body">
+        <h3>Novo usuário</h3>
+        <form data-submit="new-user">
+          <div class="row wrap" style="gap:12px;align-items:flex-start">
+            <label class="field" style="flex:1 1 240px"><span>Nome completo</span><input class="input" name="full_name" required maxlength="80" data-autofocus></label>
+            <label class="field" style="flex:1 1 240px"><span>E-mail</span><input class="input" type="email" name="email" required maxlength="120"></label>
+          </div>
+          <div class="field"><span>Forma de acesso</span>
+            <label class="choice"><input type="radio" name="mode" value="temp" checked>
+              <div><b>Criar a conta agora com senha provisória</b> (recomendado)<div class="small muted">O sistema gera uma senha que aparece uma única vez para você repassar. No primeiro acesso, a pessoa é obrigada a criar a própria senha.</div></div></label>
+            <label class="choice"><input type="radio" name="mode" value="pre">
+              <div><b>Pré-cadastro</b><div class="small muted">A pessoa cria a própria senha em "Criar conta" no site, usando este e-mail, e entra já aprovada e nos quadros escolhidos. Nenhuma senha passa por você.</div></div></label>
+          </div>
+          <label class="row" style="margin-bottom:14px;cursor:pointer"><input type="checkbox" name="is_admin"> Administrador do sistema (vê e gerencia todos os quadros e usuários)</label>
+          <div class="field"><span>Quadros e papel</span>
+            ${boards.length ? `<div class="table-wrap" style="max-height:260px;overflow-y:auto;border:1px solid var(--line);border-radius:8px"><table class="table" style="margin:0"><tbody>
+              ${boards.map((b) => `<tr><td>${esc(b.title)}${b.archived ? ' <span class="muted small">(arquivado)</span>' : ''}</td><td style="width:170px">
+                <select class="select" name="board_${b.id}" style="padding:5px 8px">
+                  <option value="">Sem acesso</option><option value="editor">Editor</option><option value="viewer">Leitor</option><option value="owner">Dono</option>
+                </select></td></tr>`).join('')}
+            </tbody></table></div>` : '<p class="empty">Nenhum quadro criado ainda.</p>'}
+          </div>
+          <div class="row"><button class="btn primary" type="submit">Cadastrar</button><button class="btn" type="button" data-act="close-modal">Cancelar</button></div>
+        </form>
+      </div></div>`);
+  }
+
+  function accessMessage(r) {
+    const first = String(r.full_name || '').split(' ')[0];
+    return `Olá, ${first}! Seu acesso ao ${APP_NAME} foi ${r.reset ? 'redefinido' : 'criado'}.\n\n` +
+      `Endereço: ${location.origin}${location.pathname.replace(/index\.html$/, '')}\nE-mail: ${r.email}\nSenha provisória: ${r.password}\n\n` +
+      'No primeiro acesso, o sistema vai pedir para você criar uma senha nova.';
+  }
+
+  function openPasswordResult(r) {
+    S.lastAccess = r;
+    openModal(`
+      <div class="modal sm"><div class="modal-body">
+        <h3>${r.reset ? 'Senha redefinida' : 'Conta criada'}</h3>
+        <p style="margin-top:0;line-height:1.5"><b>${esc(r.full_name)}</b><br><span class="muted">${esc(r.email)}</span></p>
+        <div class="field"><span>Senha provisória</span>
+          <div class="row"><code class="temp-pass">${esc(r.password)}</code><button class="btn sm" data-act="copy-text" data-what="password">Copiar</button></div>
+        </div>
+        <div class="notice err" style="line-height:1.5"><b>Esta senha não será exibida novamente.</b> Copie agora e repasse pessoalmente ou por um canal seguro. Se perder, use "Redefinir senha" para gerar outra.</div>
+        <button class="btn block" style="justify-content:center;margin-bottom:12px" data-act="copy-text" data-what="message">${icon('comment', 14)} Copiar mensagem pronta para enviar</button>
+        <button class="btn primary block" style="justify-content:center" data-act="close-access">Concluído</button>
+      </div></div>`, 'locked');
+  }
+
+  function renderForceChange() {
+    $('#app').innerHTML = `
+      <div class="auth-wrap"><div class="auth-card">
+        <div class="brand-mark" style="background:#1b3a5c;color:#fff;width:36px;height:36px">${icon('key', 20)}</div>
+        <h1>Crie sua senha</h1>
+        <div class="org">${esc(S.me.full_name)} · ${esc(S.me.email)}</div>
+        <div class="notice">Você entrou com uma senha provisória. Para continuar, crie uma senha pessoal. Ninguém, nem o administrador, terá acesso a ela.</div>
+        <form data-submit="force-password">
+          <label class="field"><span>Nova senha (mínimo 8 caracteres)</span><input class="input" type="password" name="password" minlength="8" required autocomplete="new-password" data-autofocus></label>
+          <label class="field"><span>Confirme a nova senha</span><input class="input" type="password" name="password2" minlength="8" required autocomplete="new-password"></label>
+          <div class="row"><button class="btn primary" type="submit">Salvar e continuar</button><button class="btn" type="button" data-act="logout">Sair</button></div>
+        </form>
+      </div></div>`;
+    autofocus();
+  }
+
+  // ------------------------------------------------------------------------
   // Exportação CSV
   // ------------------------------------------------------------------------
   async function exportCsv() {
@@ -1695,7 +1854,7 @@
 
     // genéricos
     'close-modal': () => closeModal(),
-    overlay: (el, ev) => { if (ev.target === el) { if (el.dataset.kind === 'card') closeCard(); else closeModal(); } },
+    overlay: (el, ev) => { if (ev.target === el && el.dataset.kind !== 'locked') { if (el.dataset.kind === 'card') closeCard(); else closeModal(); } },
     'pop-close': () => closePopover(),
     'pick-swatch': (el) => {
       const form = el.closest('form');
@@ -1932,6 +2091,34 @@
 
     // administração
     'cancel-import': () => { S.imp = null; renderAdmin(); },
+    'new-user': () => openNewUserModal(),
+    'reset-password': async (el) => {
+      const u = S.profiles[el.dataset.id];
+      if (!(await confirmDialog(`Gerar uma senha provisória nova para <b>${esc(u.full_name)}</b>? A senha atual deixa de funcionar e a pessoa terá de criar outra no próximo acesso.`, { confirmText: 'Redefinir senha' }))) return;
+      const r = await invokeAdmin({ action: 'reset_password', user_id: u.id });
+      openPasswordResult({ ...r, reset: true });
+    },
+    'copy-text': async (el) => {
+      const r = S.lastAccess;
+      if (!r) return;
+      const text = el.dataset.what === 'password' ? r.password : accessMessage(r);
+      try { await navigator.clipboard.writeText(text); toast(el.dataset.what === 'password' ? 'Senha copiada.' : 'Mensagem copiada.'); }
+      catch (e) { toast('Não foi possível copiar automaticamente. Selecione e copie manualmente.', true); }
+    },
+    'close-access': async () => {
+      if (!(await confirmDialog('Você já copiou a senha provisória? Ela não poderá ser vista de novo.', { confirmText: 'Sim, já copiei' }))) return;
+      S.lastAccess = null;
+      closeModal();
+      await showAdmin();
+    },
+    'cancel-prereg': async (el) => {
+      const r = S.admin.prereg.find((x) => x.id === el.dataset.id);
+      if (!(await confirmDialog(`Cancelar o pré-cadastro de <b>${esc(r.full_name)}</b> (${esc(r.email)})?`, { confirmText: 'Cancelar pré-cadastro', danger: true }))) return;
+      await q(sb.from('pre_registrations').delete().eq('id', r.id));
+      toast('Pré-cadastro cancelado.');
+      await showAdmin();
+    },
+    'more-audit': async () => { S.admin.auditLimit += 50; await showAdmin(); },
     'user-status': async (el) => {
       const st = el.dataset.status;
       const u = S.profiles[el.dataset.id];
@@ -1962,8 +2149,16 @@
       if (f.password.value !== f.password2.value) { S.authMsg = { type: 'err', text: 'As senhas não conferem.' }; return renderAuth(); }
       const btn = f.querySelector('[type=submit]'); btn.disabled = true;
       try {
-        const dom = await q(sb.rpc('signup_domain'));
-        if (dom && email.split('@')[1] !== dom.toLowerCase()) throw new Error(`Use seu e-mail institucional (@${dom}).`);
+        const allowed = await sb.rpc('signup_allowed', { p_email: email });
+        if (!allowed.error) {
+          if (allowed.data === false) {
+            const dom = await q(sb.rpc('signup_domain'));
+            throw new Error(`Use seu e-mail institucional${dom ? ` (@${dom})` : ''}. Se você usa outro e-mail, peça ao administrador um pré-cadastro.`);
+          }
+        } else {
+          const dom = await q(sb.rpc('signup_domain'));
+          if (dom && email.split('@')[1] !== dom.toLowerCase()) throw new Error(`Use seu e-mail institucional (@${dom}).`);
+        }
         const { data, error } = await sb.auth.signUp({
           email, password: f.password.value,
           options: { data: { full_name: f.full_name.value.trim() }, emailRedirectTo: location.origin + location.pathname }
@@ -2138,6 +2333,37 @@
         }
         throw e;
       }
+    },
+    'new-user': async (f) => {
+      const full_name = f.full_name.value.trim();
+      const email = f.email.value.trim().toLowerCase();
+      const boards = (S.admin.boards || []).map((b) => ({ board_id: b.id, role: f.elements['board_' + b.id] ? f.elements['board_' + b.id].value : '' })).filter((b) => b.role);
+      const is_admin = f.is_admin.checked;
+      const mode = f.mode.value;
+      if (Object.values(S.profiles).some((p) => p.email.toLowerCase() === email)) throw new Error('Já existe uma conta com este e-mail.');
+      const btn = f.querySelector('[type=submit]');
+      btn.disabled = true; btn.textContent = 'Cadastrando...';
+      try {
+        if (mode === 'temp') {
+          const r = await invokeAdmin({ action: 'create', full_name, email, is_admin, boards });
+          openPasswordResult(r);
+        } else {
+          await sb.from('pre_registrations').delete().eq('email', email).is('used_at', null);
+          await q(sb.from('pre_registrations').insert({ email, full_name, is_admin, boards }));
+          closeModal();
+          toast(`Pré-cadastro feito. Peça para ${full_name.split(' ')[0]} acessar o site, clicar em "Criar conta" e usar o e-mail ${email}.`, false, 9000);
+          await showAdmin();
+        }
+      } finally { btn.disabled = false; btn.textContent = 'Cadastrar'; }
+    },
+    'force-password': async (f) => {
+      if (f.password.value !== f.password2.value) return toast('As senhas não conferem.', true);
+      const { error } = await sb.auth.updateUser({ password: f.password.value });
+      if (error) throw error;
+      await q(sb.rpc('password_changed'));
+      await loadMe();
+      toast('Senha criada. Bem-vindo(a)!');
+      route();
     },
     'admin-config': async (f) => {
       const dom = f.allowed_domain.value.trim().replace(/^@/, '').toLowerCase() || null;
@@ -2328,7 +2554,9 @@
         }
         return closeCard();
       }
-      if ($('#modal-root .overlay')) return closeModal();
+      const ov = $('#modal-root .overlay');
+      if (ov && ov.dataset.kind === 'locked') return;
+      if (ov) return closeModal();
       if (S.addingCardTo || S.addingList) { S.addingCardTo = null; S.addingList = false; return renderBoard(); }
       if (S.drawer) { S.drawer = null; return renderBoard(); }
     }
