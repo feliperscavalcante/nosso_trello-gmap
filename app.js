@@ -57,6 +57,7 @@
     const m = (e && (e.message || e.error_description || e.msg)) || String(e);
     const map = [
       [/Invalid login credentials/i, 'E-mail ou senha incorretos.'],
+      [/Signups? not allowed|signup_disabled|Email signups are disabled/i, 'O cadastro pela tela de login está desligado no servidor. Peça ao administrador para criar sua conta pela tela de Administração ou para reativar os cadastros no Supabase.'],
       [/Email not confirmed/i, 'Confirme seu e-mail (link enviado na criação da conta) antes de entrar.'],
       [/User already registered/i, 'Este e-mail já está cadastrado. Use "Entrar" ou "Esqueci a senha".'],
       [/Database error saving new user/i, 'Cadastro recusado. Verifique se está usando o e-mail institucional permitido.'],
@@ -219,6 +220,7 @@
     if (!S.session) { cleanupBoard(); return renderAuth(); }
     if (!S.me || S.me.status !== 'active') { cleanupBoard(); return renderPending(); }
     if (S.me.must_change_password && !S.recovery) { cleanupBoard(); closeModal(); return renderForceChange(); }
+    maybeSyncCatalogs();
     const parts = location.hash.replace(/^#\/?/, '').split('/');
     try {
       if (parts[0] === 'b' && parts[1]) return await showBoard(parts[1], parts[2] === 'c' ? parts[3] : null);
@@ -1308,7 +1310,9 @@
     const pr = await sb.from('pre_registrations').select('*').is('used_at', null).order('created_at', { ascending: false });
     const au = await sb.from('admin_audit').select('*').order('created_at', { ascending: false }).limit(limit);
     const tp = await sb.from('card_templates').select('*').order('name');
-    S.admin = { templates: tp.error ? null : tp.data, cfg: cfg || {}, boards, usage, prereg: pr.error ? null : pr.data, audit: au.error ? null : au.data, auditLimit: limit };
+    const ct = await sb.from('catalogs').select('*').order('name');
+    if (!ct.error) S.catalogs = ct.data;
+    S.admin = { catalogs: ct.error ? null : ct.data, templates: tp.error ? null : tp.data, cfg: cfg || {}, boards, usage, prereg: pr.error ? null : pr.data, audit: au.error ? null : au.data, auditLimit: limit };
     renderAdmin();
   }
 
@@ -1366,6 +1370,7 @@
           ${renderPreRegs()}
         </section>
         ${renderTemplatesAdmin()}
+        ${renderCatalogsAdmin()}
         ${renderAudit()}
         <section class="panel" style="margin-bottom:20px">
           <h2>${icon('board')} Importar do Trello</h2>
@@ -1680,8 +1685,8 @@
   // ------------------------------------------------------------------------
   // Cadastro de usuários pelo administrador
   // ------------------------------------------------------------------------
-  async function invokeAdmin(body) {
-    const { data, error } = await sb.functions.invoke('admin-users', { body });
+  async function invokeAdmin(body, fn = 'admin-users') {
+    const { data, error } = await sb.functions.invoke(fn, { body });
     if (error) {
       let msg = error.message || 'Falha ao chamar a função do servidor.';
       try {
@@ -1693,7 +1698,9 @@
       if (/invalid jwt|jwt/i.test(msg) && !/Sessão/.test(msg)) {
         msg = 'O Supabase recusou a chamada da função (JWT). No painel do Supabase, abra Edge Functions > admin-users > Settings, desligue a opção "Verify JWT" e salve. A própria função já confere se quem chama é administrador.';
       } else if (/not found|404|Failed to send a request|FunctionsFetchError|FunctionsRelayError/i.test(msg)) {
-        msg = 'A função "admin-users" ainda não foi criada no Supabase. Siga o passo a passo do guia (Edge Function) ou use a opção "Pré-cadastro", que não depende dela.';
+        msg = fn === 'admin-users'
+          ? 'A função "admin-users" ainda não foi criada no Supabase. Siga o passo a passo do guia (Edge Function) ou use a opção "Pré-cadastro", que não depende dela.'
+          : `A função "${fn}" ainda não foi criada no Supabase. Siga o passo a passo do guia (Edge Function).`;
       }
       throw new Error(msg);
     }
@@ -1714,7 +1721,11 @@
     template_updated: (t) => `alterou o template ${t}`,
     template_deleted: (t) => `excluiu o template ${t}`,
     template_activated: (t) => `ativou o template ${t}`,
-    template_deactivated: (t) => `desativou o template ${t}`
+    template_deactivated: (t) => `desativou o template ${t}`,
+    catalog_created: (t) => `criou o cadastro de referência ${t}`,
+    catalog_updated: (t) => `alterou a configuração do cadastro ${t}`,
+    catalog_deleted: (t) => `excluiu o cadastro de referência ${t}`,
+    catalog_synced: (t, d) => `sincronizou o cadastro ${t} (${d.total} itens${d.deactivated ? `, ${d.deactivated} desativado(s)` : ''})`
   };
   const STATUS_NAME = { pending: 'Pendente', active: 'Ativo', inactive: 'Inativo' };
 
@@ -1838,7 +1849,9 @@
     text: 'Texto curto',
     textarea: 'Texto longo',
     number: 'Número',
-    date: 'Data'
+    date: 'Data',
+    catalog: 'Pesquisa em cadastro (uma resposta)',
+    items: 'Lista de itens com quantidade (cadastro)'
   };
   const CHOICE = (t) => t === 'checkbox' || t === 'radio' || t === 'select';
   const boardTemplates = () => (S.templates || []).filter((t) => t.active && (t.all_boards || (t.boards || []).includes(S.board.id)));
@@ -1861,6 +1874,12 @@
     const a = {};
     tpl.fields.forEach((f) => {
       const n = 'f_' + f.key;
+      if (CATALOG_TYPES(f.type)) {
+        const st = S.tplForm && S.tplForm.cat && S.tplForm.cat[f.key];
+        if (f.type === 'catalog') a[f.key] = st && st.value ? { key: st.value.key, label: st.value.label } : null;
+        else a[f.key] = st ? st.value.filter((r) => r.key).map((r) => ({ key: r.key, label: r.label, qty: String(r.qty ?? '').trim(), cols: { ...(r.cols || {}) } })) : [];
+        return;
+      }
       if (f.type === 'checkbox') a[f.key] = $$(`input[name="${n}"]:checked`, form).map((i) => i.value);
       else if (f.type === 'radio') { const c = $(`input[name="${n}"]:checked`, form); a[f.key] = c ? c.value : ''; }
       else { const el = form.elements[n]; a[f.key] = el ? el.value.trim() : ''; }
@@ -1871,6 +1890,8 @@
   }
   function answerText(f, a) {
     const v = a[f.key];
+    if (f.type === 'catalog') return v && v.label ? v.label : '';
+    if (f.type === 'items') { const l = (v || []).map((r) => r.label); return l.length > 2 ? `${l.slice(0, 2).join(', ')} e mais ${l.length - 2}` : l.join(', '); }
     const list = Array.isArray(v) ? v : (v ? [v] : []);
     return list.map((x) => (x === '__other__' ? (a[f.key + '__other'] || '') : x)).filter(Boolean).join(', ');
   }
@@ -1888,6 +1909,8 @@
     (data || []).forEach((d) => {
       const f = tpl.fields.find((x) => x.key === d.key);
       if (!f) return;
+      if (f.type === 'catalog') { a[f.key] = d.ref && d.ref[0] ? { ...d.ref[0] } : null; return; }
+      if (f.type === 'items') { a[f.key] = (d.ref || []).map((r) => ({ ...r })); return; }
       const vals = (d.values || []).map((v) => {
         if (CHOICE(f.type) && /^Outros: /.test(v) && !(f.options || []).some((o) => o.label === v)) { a[f.key + '__other'] = v.replace(/^Outros: /, ''); return '__other__'; }
         return v;
@@ -1904,7 +1927,9 @@
     const help = f.help ? `<div class="small muted" style="margin:-2px 0 6px">${esc(f.help)}</div>` : '';
     const otherVal = a[f.key + '__other'] || '';
     let input = '';
-    if (f.type === 'checkbox' || f.type === 'radio') {
+    if (CATALOG_TYPES(f.type)) {
+      input = `<div class="cat-field" data-key="${esc(f.key)}">${renderCatInner(f)}</div>`;
+    } else if (f.type === 'checkbox' || f.type === 'radio') {
       const sel = f.type === 'checkbox' ? (Array.isArray(v) ? v : []) : [v];
       const opts = (f.options || []).map((o) => `
         <label class="opt-check"><input type="${f.type}" name="${n}" value="${esc(o.label)}" ${sel.includes(o.label) ? 'checked' : ''} ${o.exclusive ? 'data-excl="1"' : ''}> <span>${esc(o.label)}</span></label>`).join('');
@@ -1930,9 +1955,16 @@
   }
 
   // mode: 'new' (criar cartão), 'edit' (editar respostas), 'preview' (pré-visualizar no construtor)
-  function openTemplateForm(tpl, opts) {
-    S.tplForm = { tpl, ...opts };
+  async function openTemplateForm(tpl, opts) {
+    const catFields = tpl.fields.filter((f) => CATALOG_TYPES(f.type));
+    if (catFields.length) {
+      if (!S.catalogs || !S.catalogs.length) await loadCatalogs();
+      catFields.filter((f) => f.group_filter && f.catalog).forEach((f) => {
+        loadCatalogGroups(f.catalog).then(() => { if (S.tplForm && S.tplForm.tpl === tpl) refreshGroupSelect(f); });
+      });
+    }
     const a = opts.mode === 'edit' ? answersFromCard(tpl, opts.card.form_data) : {};
+    S.tplForm = { tpl, ...opts, cat: initCatState(tpl, a) };
     const lists = opts.mode === 'new' ? activeLists() : [];
     const title = opts.mode === 'edit' ? 'Editar respostas' : opts.mode === 'preview' ? `Pré-visualização: ${tpl.name}` : tpl.name;
     openModal(`
@@ -1997,6 +2029,9 @@
       const v = a[f.key];
       const empty = Array.isArray(v) ? !v.length : !v;
       if (f.required && empty) return `Responda o campo obrigatório "${f.label}".`;
+      if (f.type === 'items' && (v || []).some((r) => !/^\d+$/.test(r.qty) || Number(r.qty) < 1)) return `Informe quantidades inteiras maiores que zero em "${f.label}".`;
+      if (f.type === 'items') for (const r of v || []) for (const c of f.columns || []) if (c.required !== false && !(r.cols || {})[c.key]) return `Informe "${c.label}" para o item "${r.label}".`;
+      if (CATALOG_TYPES(f.type)) continue;
       const vals = Array.isArray(v) ? v : [v];
       if (vals.includes('__other__') && !a[f.key + '__other']) return `Descreva a opção "Outros" em "${f.label}".`;
     }
@@ -2013,14 +2048,336 @@
         <div class="small muted" style="margin:-4px 0 8px">Solicitado por ${esc(userName(c.created_by))} em ${fmtDate(c.created_at)}</div>
         <dl class="form-data">
           ${c.form_data.map((d) => `<dt>${esc(d.label)}</dt><dd>${(d.values || []).length
-            ? (d.type === 'textarea' ? `<div style="white-space:pre-wrap">${linkify(d.values[0])}</div>`
+            ? (d.type === 'items' ? itemsTable(d)
+              : d.type === 'catalog' ? `${esc(d.values[0])}${d.ref && d.ref[0] && d.ref[0].group ? `<div class="small muted">${esc(d.ref[0].group)}</div>` : ''}`
+              : d.type === 'textarea' ? `<div style="white-space:pre-wrap">${linkify(d.values[0])}</div>`
               : (d.values.length > 1 || d.type === 'checkbox') ? d.values.map((v) => `<span class="pill">${esc(v)}</span>`).join(' ')
               : esc(d.type === 'date' ? fmtDate(d.values[0], false) : d.values[0]))
             : '<span class="muted">Não informado</span>'}</dd>`).join('')}
         </dl>
       </div>`;
   }
+  function itemsTable(d) {
+    const rows = d.ref || [];
+    const total = rows.reduce((n, r) => n + (Number(r.qty) || 0), 0);
+    const cols = d.columns || [];
+    const meta = (r) => cols.filter((c) => (r.cols || {})[c.key]).map((c) => `<span><b>${esc(c.label)}:</b> ${esc(r.cols[c.key])}</span>`).join('');
+    return `<div class="table-wrap"><table class="items-table"><thead><tr><th style="width:56px">Qtd.</th><th>Item</th></tr></thead><tbody>
+      ${rows.map((r) => `<tr><td class="num">${esc(r.qty)}</td><td>${esc(r.label)}${cols.length ? `<div class="item-meta">${meta(r)}</div>` : ''}</td></tr>`).join('')}</tbody></table></div>
+      <div class="small muted" style="margin-top:4px">${rows.length} item(ns) · ${total} unidade(s)</div>`;
+  }
   const formDataText = (c) => (c.form_data || []).map((d) => `${d.label}: ${(d.values || []).join(', ')}`).join('; ');
+
+  // ---------- Cadastros de referência (pesquisa e lista de itens) ----------
+  const CATALOG_TYPES = (t) => t === 'catalog' || t === 'items';
+  const catalogById = (id) => (S.catalogs || []).find((c) => c.id === id);
+  async function loadCatalogs() {
+    const r = await sb.from('catalogs').select('*').order('name');
+    S.catalogs = r.error ? [] : r.data;
+    return S.catalogs;
+  }
+  async function loadCatalogGroups(id) {
+    S.catGroups = S.catGroups || {};
+    if (S.catGroups[id]) return S.catGroups[id];
+    const r = await sb.rpc('catalog_groups', { p_catalog: id });
+    S.catGroups[id] = r.error ? [] : r.data;
+    return S.catGroups[id];
+  }
+  async function maybeSyncCatalogs() {
+    if (S.catAutoSynced) return;
+    S.catAutoSynced = true;
+    try {
+      const cats = await loadCatalogs();
+      const limit = Date.now() - 12 * 3600 * 1000;
+      if (cats.some((c) => !c.last_sync_at || new Date(c.last_sync_at).getTime() < limit)) {
+        await sb.functions.invoke('sync-catalogs', { body: { action: 'sync' } });
+        await loadCatalogs();
+      }
+    } catch (e) { /* a sincronização automática é silenciosa */ }
+  }
+
+  function initCatState(tpl, a) {
+    const st = {};
+    tpl.fields.filter((f) => CATALOG_TYPES(f.type)).forEach((f) => {
+      const v = a[f.key];
+      if (f.type === 'catalog') st[f.key] = { group: '', value: v && v.key ? v : null };
+      else {
+        const rows = Array.isArray(v) ? v.filter((r) => r && r.key).map((r) => ({ ...r, cols: { ...(r.cols || {}) } })) : [];
+        rows.push({ key: '', qty: 1, cols: {} });
+        st[f.key] = { group: '', value: rows };
+      }
+    });
+    return st;
+  }
+  const comboHtml = (key, i) => `
+    <div class="combo">
+      <input class="input combo-input" data-key="${esc(key)}" ${i != null ? `data-i="${i}"` : ''} placeholder="Digite para pesquisar (nome ou código)..." autocomplete="off" aria-label="Pesquisar">
+      <div class="combo-list hidden" role="listbox"></div>
+    </div>`;
+
+  function renderCatInner(f) {
+    const st = S.tplForm.cat[f.key];
+    const cat = catalogById(f.catalog);
+    if (!cat) return '<div class="notice err">O cadastro usado nesta pergunta não foi encontrado. O administrador precisa revisar o template.</div>';
+    if (!cat.active_count && !cat.last_sync_at) return '<div class="notice">Este cadastro ainda não foi sincronizado. O administrador precisa clicar em "Sincronizar" na tela de Administração.</div>';
+    const groupSel = f.group_filter && cat.group_column ? `
+      <select class="select cat-group" data-key="${esc(f.key)}" style="max-width:380px;margin-bottom:6px" aria-label="Filtrar por ${esc(cat.group_label || cat.group_column)}">
+        ${groupOptions(f, cat, st)}
+      </select>` : '';
+    if (f.type === 'catalog') {
+      return groupSel + (st.value
+        ? `<div class="cat-chip"><span>${esc(st.value.label)}${st.value.group ? `<small>${esc(st.value.group)}</small>` : ''}</span><button type="button" class="icon-btn" data-act="cat-clear" data-key="${esc(f.key)}" title="Trocar">${icon('x', 14)}</button></div>`
+        : comboHtml(f.key, null));
+    }
+    const rows = st.value;
+    const filled = rows.filter((r) => r.key);
+    const total = filled.reduce((n, r) => n + (parseInt(r.qty, 10) || 0), 0);
+    return groupSel + `
+      <div class="items-head"><span style="flex:1">${esc(cat.name)}</span><span style="width:110px">${esc(f.qty_label || 'Quantidade')}</span><span style="width:32px"></span></div>
+      ${rows.map((r, i) => `
+        <div class="${(f.columns || []).length ? 'item-block' : ''}">
+        <div class="item-row">
+          <div style="flex:1;min-width:0">${r.key ? `<div class="cat-chip"><span>${esc(r.label)}</span></div>` : comboHtml(f.key, i)}</div>
+          <input class="input qty" type="number" min="1" step="1" inputmode="numeric" value="${esc(r.qty ?? 1)}" data-key="${esc(f.key)}" data-i="${i}" aria-label="${esc(f.qty_label || 'Quantidade')}">
+          <button type="button" class="icon-btn" data-act="item-del" data-key="${esc(f.key)}" data-i="${i}" title="Remover linha">${icon('x', 14)}</button>
+        </div>
+        ${(f.columns || []).length ? `<div class="item-cols">${f.columns.map((c) => `
+          <select class="select item-col ${r.key && c.required !== false && !(r.cols || {})[c.key] ? 'missing' : ''}" data-key="${esc(f.key)}" data-i="${i}" data-col="${esc(c.key)}" aria-label="${esc(c.label)}">
+            <option value="">${esc(c.label)}${c.required !== false ? ' *' : ''}</option>
+            ${(c.options || []).map((o) => `<option ${(r.cols || {})[c.key] === o ? 'selected' : ''}>${esc(o)}</option>`).join('')}
+          </select>`).join('')}</div>` : ''}
+        </div>`).join('')}
+      <div class="row wrap" style="justify-content:space-between">
+        <button type="button" class="btn sm" data-act="item-add" data-key="${esc(f.key)}">${icon('plus', 14)} Adicionar linha</button>
+        <span class="small muted items-summary">${filled.length} item(ns) · ${total} unidade(s)</span>
+      </div>`;
+  }
+  function groupOptions(f, cat, st) {
+    const groups = (S.catGroups || {})[f.catalog];
+    return `<option value="">${esc(cat.group_label || cat.group_column)}: ${groups ? 'todas' : 'carregando...'}</option>
+      ${(groups || []).map((g) => `<option value="${esc(g.group_value)}" ${st.group === g.group_value ? 'selected' : ''}>${esc(g.group_value)} (${g.items})</option>`).join('')}`;
+  }
+  // Atualiza só as opções do filtro, sem apagar o que a pessoa já digitou
+  function refreshGroupSelect(f) {
+    const sel = $(`.cat-field[data-key="${f.key}"] select.cat-group`);
+    const cat = catalogById(f.catalog);
+    if (sel && cat) sel.innerHTML = groupOptions(f, cat, S.tplForm.cat[f.key]);
+  }
+  function rerenderCatField(key, focus) {
+    const f = S.tplForm.tpl.fields.find((x) => x.key === key);
+    const box = $(`.cat-field[data-key="${key}"]`);
+    if (!f || !box) return;
+    box.innerHTML = renderCatInner(f);
+    refreshTplTitle();
+    if (focus === 'combo') { const i = $('.combo-input', box); if (i) i.focus(); }
+    if (typeof focus === 'number') { const q = $(`.qty[data-i="${focus}"]`, box); if (q) { q.focus(); q.select(); } }
+  }
+  function refreshTplTitle() {
+    const form = $('form[data-tplform]');
+    if (!form || !S.tplForm) return;
+    const t = form.elements.__title;
+    if (t && t.dataset.titleAuto) t.value = suggestTitle(S.tplForm.tpl, collectAnswers(form, S.tplForm.tpl));
+  }
+  function markText(label, q) {
+    let out = esc(label);
+    String(q || '').trim().split(/\s+/).filter((w) => w.length > 1).forEach((w) => {
+      const re = new RegExp(`(${w.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&').split('').map((ch) => `${ch}[\\u0300-\\u036f]*`).join('')})`, 'ig');
+      out = out.normalize('NFD').replace(re, '<mark>$1</mark>').normalize('NFC');
+    });
+    return out;
+  }
+  async function runComboSearch(input) {
+    if (!S.tplForm) return;
+    const key = input.dataset.key;
+    const f = S.tplForm.tpl.fields.find((x) => x.key === key);
+    const st = S.tplForm.cat[key];
+    const list = input.nextElementSibling;
+    list.classList.remove('hidden');
+    if (!list.innerHTML) list.innerHTML = '<div class="combo-empty">Pesquisando...</div>';
+    const seq = (input._seq = (input._seq || 0) + 1);
+    const { data, error } = await sb.rpc('search_catalog', { p_catalog: f.catalog, p_query: input.value, p_group: st.group || null, p_limit: 20 });
+    if (seq !== input._seq || !document.contains(input)) return;
+    if (error) { list.innerHTML = `<div class="combo-empty">${esc(errMsg(error))}</div>`; return; }
+    input._results = data || [];
+    input._hi = 0;
+    list.innerHTML = input._results.length
+      ? input._results.map((r, j) => `<button type="button" class="combo-opt ${j === 0 ? 'hi' : ''}" data-act="combo-pick" data-j="${j}"><span>${markText(r.label, input.value)}</span>${r.group_value && !st.group ? `<small>${esc(r.group_value)}</small>` : ''}</button>`).join('') +
+        (input._results.length >= 20 ? '<div class="combo-empty">Mostrando os 20 primeiros. Digite mais para refinar.</div>' : '')
+      : `<div class="combo-empty">Nenhum resultado${st.group ? ` em ${esc(st.group)}` : ''}. Tente outra palavra${st.group ? ' ou mude o filtro' : ''}.</div>`;
+  }
+  function pickCatalogItem(input, r) {
+    const key = input.dataset.key;
+    const f = S.tplForm.tpl.fields.find((x) => x.key === key);
+    const st = S.tplForm.cat[key];
+    const item = { key: r.key, label: r.label, group: r.group_value };
+    if (f.type === 'catalog') { st.value = item; return rerenderCatField(key); }
+    const i = Number(input.dataset.i);
+    const own = st.value[i].cols || {}, prev = i > 0 ? st.value[i - 1].cols || {} : {};
+    const cols = Object.values(own).some(Boolean) ? own : { ...prev };
+    if (!(f.columns || []).length && st.value.some((x, k) => k !== i && x.key === r.key)) toast('Este item já está na lista. As quantidades serão somadas ao salvar.');
+    st.value[i] = { ...item, qty: st.value[i].qty || 1, cols };
+    if (i === st.value.length - 1) st.value.push({ key: '', qty: 1, cols: {} });
+    rerenderCatField(key, i);
+  }
+  function moveComboHighlight(input, d) {
+    const opts = $$('.combo-opt', input.nextElementSibling);
+    if (!opts.length) return;
+    input._hi = Math.max(0, Math.min(opts.length - 1, (input._hi || 0) + d));
+    opts.forEach((o, j) => o.classList.toggle('hi', j === input._hi));
+    opts[input._hi].scrollIntoView({ block: 'nearest' });
+  }
+  document.addEventListener('input', (ev) => {
+    const el = ev.target;
+    if (el.classList && el.classList.contains('combo-input')) {
+      clearTimeout(el._t);
+      el._t = setTimeout(() => runComboSearch(el), 220);
+    }
+    if (el.classList && el.classList.contains('qty') && S.tplForm) {
+      const st = S.tplForm.cat[el.dataset.key];
+      if (st && st.value[Number(el.dataset.i)]) st.value[Number(el.dataset.i)].qty = el.value;
+      const box = el.closest('.cat-field');
+      const filled = st.value.filter((r) => r.key);
+      const sum = $('.items-summary', box);
+      if (sum) sum.textContent = `${filled.length} item(ns) · ${filled.reduce((n, r) => n + (parseInt(r.qty, 10) || 0), 0)} unidade(s)`;
+    }
+  });
+  document.addEventListener('focusin', (ev) => {
+    const el = ev.target;
+    if (el.classList && el.classList.contains('combo-input') && !el.value) runComboSearch(el);
+  });
+  document.addEventListener('focusout', (ev) => {
+    const el = ev.target;
+    if (el.classList && el.classList.contains('combo-input')) setTimeout(() => { if (document.activeElement !== el && el.nextElementSibling) el.nextElementSibling.classList.add('hidden'); }, 180);
+  });
+  document.addEventListener('change', (ev) => {
+    const el = ev.target;
+    if (!(el.classList && el.classList.contains('item-col')) || !S.tplForm) return;
+    const row = S.tplForm.cat[el.dataset.key].value[Number(el.dataset.i)];
+    if (row) { row.cols = row.cols || {}; row.cols[el.dataset.col] = el.value; }
+    el.classList.toggle('missing', !el.value && row && !!row.key);
+  });
+  document.addEventListener('change', async (ev) => {
+    const el = ev.target;
+    if (!(el.classList && el.classList.contains('cat-group')) || !S.tplForm) return;
+    S.tplForm.cat[el.dataset.key].group = el.value;
+    const box = el.closest('.cat-field');
+    const input = $('.combo-input', box);
+    if (input) { input.focus(); runComboSearch(input); }
+  });
+  function handleCatalogKeys(ev) {
+    const el = ev.target;
+    if (!el.classList) return false;
+    if (el.classList.contains('combo-input')) {
+      const list = el.nextElementSibling;
+      const open = list && !list.classList.contains('hidden');
+      if (ev.key === 'ArrowDown') { ev.preventDefault(); if (!open) runComboSearch(el); else moveComboHighlight(el, 1); return true; }
+      if (ev.key === 'ArrowUp') { ev.preventDefault(); moveComboHighlight(el, -1); return true; }
+      if (ev.key === 'Enter') { ev.preventDefault(); if (open && el._results && el._results[el._hi || 0]) pickCatalogItem(el, el._results[el._hi || 0]); return true; }
+      if (ev.key === 'Escape' && open) { ev.preventDefault(); ev.stopPropagation(); list.classList.add('hidden'); return true; }
+    }
+    if (el.classList.contains('qty') && ev.key === 'Enter') {
+      ev.preventDefault();
+      const box = el.closest('.cat-field');
+      const next = $('.combo-input', box);
+      if (next) next.focus();
+      return true;
+    }
+    return false;
+  }
+
+  // ---------- Cadastros de referência (Administração) ----------
+  function renderCatalogsAdmin() {
+    const list = S.admin.catalogs;
+    if (list === null) return `<section class="panel" style="margin-bottom:20px"><h2>${icon('board')} Cadastros de referência</h2><div class="notice">Para usar cadastros (Entidades, Materiais), execute o arquivo <b>atualizacao-05-cadastros.sql</b> no SQL Editor do Supabase.</div></section>`;
+    return `
+      <section class="panel" style="margin-bottom:20px">
+        <h2>${icon('board')} Cadastros de referência
+          <span class="spacer"></span>
+          ${list.length ? `<button class="btn sm" data-act="cat-sync">${icon('restore', 14)} Sincronizar todos</button>` : ''}
+          <button class="btn primary sm" data-act="cat-new">${icon('plus', 14)} Novo cadastro</button></h2>
+        <p class="small muted" style="margin:0 0 8px;line-height:1.5">Listas lidas de planilhas publicadas no Google Planilhas e usadas nas perguntas de pesquisa dos templates. A atualização é automática a cada 12 horas, quando alguém usa o sistema; depois de editar a planilha, use <b>Sincronizar</b> para ver a mudança na hora.</p>
+        ${list.length ? `<div class="table-wrap"><table class="table"><tbody>
+          ${list.map((c) => `
+            <tr>
+              <td><div style="font-weight:600">${esc(c.name)}</div><div class="small muted">${c.active_count} itens ativos${c.group_column ? ` · filtro por ${esc(c.group_label || c.group_column)}` : ''}</div></td>
+              <td>${c.last_sync_at
+                ? `<span class="status ${c.last_sync_status === 'ok' ? 'active' : 'error'}">${c.last_sync_status === 'ok' ? 'Sincronizado' : 'Erro'}</span> <span class="small muted">${relTime(c.last_sync_at)}</span>
+                   <div class="small ${c.last_sync_status === 'ok' ? 'muted' : ''}" style="margin-top:4px;line-height:1.4;${c.last_sync_status === 'ok' ? '' : 'color:var(--danger)'}">${esc(c.last_sync_message || '')}</div>`
+                : '<span class="small muted">Ainda não sincronizado</span>'}</td>
+              <td style="text-align:right;white-space:nowrap">
+                <button class="btn sm" data-act="cat-sync" data-id="${esc(c.id)}">Sincronizar</button>
+                <button class="btn sm" data-act="cat-edit" data-id="${esc(c.id)}">Editar</button>
+                <button class="btn sm" data-act="cat-del" data-id="${esc(c.id)}">Excluir</button>
+              </td>
+            </tr>`).join('')}
+        </tbody></table></div>` : '<p class="empty">Nenhum cadastro configurado.</p>'}
+      </section>`;
+  }
+
+  function renderCatEditor() {
+    const c = S.catEdit;
+    const opts = (sel) => (c.header || []).map((h) => `<option value="${esc(h)}" ${sel === h ? 'selected' : ''}>${esc(h)}</option>`).join('');
+    const sampleLabels = (c.sample || []).slice(0, 4).map((r) => {
+      const idx = (h) => (c.header || []).indexOf(h);
+      const label = (c.label_columns || []).filter(Boolean).map((h) => (r[idx(h)] || '').trim()).filter(Boolean).join(' - ');
+      const g = c.group_column ? (r[idx(c.group_column)] || '').trim() : '';
+      return `<li>${esc(label || '(vazio)')}${g ? ` <span class="muted small">· ${esc(g)}</span>` : ''}</li>`;
+    }).join('');
+    openModal(`
+      <div class="modal"><button class="icon-btn modal-close" data-act="cat-cancel">${icon('x')}</button>
+      <div class="modal-body">
+        <h3>${c.id ? 'Editar cadastro' : 'Novo cadastro de referência'}</h3>
+        <form data-submit="cat-save">
+          <label class="field"><span>Nome</span><input class="input" value="${esc(c.name)}" data-ce="name" maxlength="60" required placeholder="Ex.: Entidades"></label>
+          <label class="field"><span>Link da planilha publicada (CSV)</span>
+            <div class="row"><input class="input" value="${esc(c.source_url)}" data-ce="source_url" required placeholder="https://docs.google.com/spreadsheets/d/e/.../pub?gid=...&single=true&output=csv">
+            <button class="btn" type="button" data-act="cat-preview">${c.loading ? 'Lendo...' : 'Ler colunas'}</button></div>
+            <div class="small muted" style="margin-top:4px;line-height:1.5">No Google Planilhas: Arquivo &gt; Compartilhar &gt; Publicar na Web, escolha a aba e o formato CSV. A aba precisa abrir sem login.</div></label>
+          ${c.header ? `
+            <div class="notice ok">Planilha lida: ${c.total} linha(s) e ${c.header.length} coluna(s).</div>
+            <label class="field"><span>Coluna com o identificador único (código)</span><select class="select" data-ce="key_column" data-cerender="1"><option value="">Escolha...</option>${opts(c.key_column)}</select>
+              <div class="small muted" style="margin-top:4px">Não pode se repetir nem mudar com o tempo. É por ela que o sistema sabe o que foi incluído, alterado ou removido.</div></label>
+            <div class="field"><span>Texto exibido na pesquisa (colunas unidas por " - ")</span>
+              <div class="row wrap">${[0, 1, 2].map((k) => `<select class="select" style="flex:1 1 180px" data-ce="label_columns.${k}" data-cerender="1"><option value="">${k ? '(opcional)' : 'Escolha...'}</option>${opts((c.label_columns || [])[k])}</select>`).join('')}</div></div>
+            <div class="row wrap" style="gap:12px;align-items:flex-start">
+              <label class="field" style="flex:1 1 220px"><span>Coluna para o filtro encadeado (opcional)</span><select class="select" data-ce="group_column" data-cerender="1"><option value="">Sem filtro</option>${opts(c.group_column)}</select></label>
+              <label class="field" style="flex:1 1 180px"><span>Nome do filtro na tela</span><input class="input" value="${esc(c.group_label || '')}" data-ce="group_label" maxlength="30" placeholder="Ex.: GRE"></label>
+            </div>
+            ${sampleLabels ? `<div class="field"><span>Prévia</span><ul class="small" style="margin:0;padding-left:18px;line-height:1.6">${sampleLabels}</ul></div>` : ''}`
+          : c.id ? '<div class="notice">Clique em "Ler colunas" para revisar a configuração das colunas.</div>' : ''}
+          <div class="row wrap" style="margin-top:8px">
+            <button class="btn primary" type="submit" ${c.header ? '' : 'disabled'}>Salvar e sincronizar</button>
+            <button class="btn" type="button" data-act="cat-cancel">Cancelar</button>
+          </div>
+        </form>
+      </div></div>`, 'locked');
+  }
+  document.addEventListener('input', (ev) => { const el = ev.target; if (S.catEdit && el.dataset && el.dataset.ce && !el.dataset.cerender) setPath(S.catEdit, el.dataset.ce, el.value); });
+  document.addEventListener('change', (ev) => {
+    const el = ev.target;
+    if (!S.catEdit || !el.dataset || !el.dataset.ce) return;
+    if (el.dataset.ce.startsWith('label_columns.')) { S.catEdit.label_columns = S.catEdit.label_columns || []; }
+    setPath(S.catEdit, el.dataset.ce, el.value);
+    if (el.dataset.cerender) renderCatEditor();
+  });
+  async function catPreview() {
+    const c = S.catEdit;
+    if (!c.source_url) return toast('Cole o link da planilha publicada.', true);
+    c.loading = true; renderCatEditor();
+    try {
+      const r = await invokeAdmin({ action: 'preview', url: c.source_url }, 'sync-catalogs');
+      Object.assign(c, { header: r.header, sample: r.sample, total: r.total });
+      if (c.key_column && !r.header.includes(c.key_column)) c.key_column = '';
+      c.label_columns = (c.label_columns || []).map((h) => (r.header.includes(h) ? h : ''));
+      if (c.group_column && !r.header.includes(c.group_column)) c.group_column = '';
+    } finally { c.loading = false; if (S.catEdit) renderCatEditor(); }
+  }
+  async function catSync(id) {
+    const r = await invokeAdmin(id ? { action: 'sync', catalog_id: id } : { action: 'sync' }, 'sync-catalogs');
+    (r.results || []).forEach((x) => toast(`${x.name}: ${x.message}`, !x.ok, 9000));
+    S.catGroups = {};
+    await loadCatalogs();
+  }
 
   // ---------- Construtor de templates (Administração) ----------
   function renderTemplatesAdmin() {
@@ -2068,6 +2425,29 @@
             </div>
           </div>
           <label class="field" style="margin:10px 0 8px"><span>Texto de ajuda (opcional)</span><input class="input" value="${esc(f.help || '')}" data-tf="fields.${i}.help" maxlength="200"></label>
+          ${CATALOG_TYPES(f.type) ? (() => { const cat = (S.admin.catalogs || []).find((c) => c.id === f.catalog); return `
+            <div class="row wrap" style="gap:12px;margin-bottom:8px;align-items:flex-end">
+              <label class="field" style="flex:1 1 220px;margin:0"><span>Cadastro usado na pesquisa</span><select class="select" data-tf="fields.${i}.catalog" data-rerender="1">
+                <option value="">Escolha...</option>${(S.admin.catalogs || []).map((c) => `<option value="${esc(c.id)}" ${f.catalog === c.id ? 'selected' : ''}>${esc(c.name)} (${c.active_count} itens)</option>`).join('')}</select></label>
+              ${f.type === 'items' ? `<label class="field" style="flex:1 1 180px;margin:0"><span>Nome da coluna de quantidade</span><input class="input" value="${esc(f.qty_label || 'Quantidade')}" data-tf="fields.${i}.qty_label" maxlength="30"></label>` : ''}
+            </div>
+            ${!(S.admin.catalogs || []).length ? '<div class="notice">Nenhum cadastro de referência configurado. Crie um em "Cadastros de referência", nesta mesma tela.</div>' : ''}
+            ${cat && cat.group_column ? `<label class="row small" style="cursor:pointer;margin-bottom:6px"><input type="checkbox" ${f.group_filter ? 'checked' : ''} data-tf="fields.${i}.group_filter" data-tf-type="bool"> Mostrar filtro por ${esc(cat.group_label || cat.group_column)} antes da pesquisa (filtro encadeado)</label>` : ''}
+            ${f.type === 'items' ? `
+              <div class="small" style="font-weight:600;color:var(--ink-2);margin:10px 0 4px">Colunas por item</div>
+              <div class="small muted" style="margin-bottom:6px;line-height:1.5">Escolhas feitas em cada linha da lista (ex.: motivo, prioridade, ambiente). Escreva uma opção por linha.</div>
+              ${(f.columns || []).map((c, j) => `
+                <div class="tpl-col">
+                  <div class="row wrap" style="gap:8px">
+                    <input class="input" style="flex:1 1 200px" value="${esc(c.label)}" data-tf="fields.${i}.columns.${j}.label" maxlength="40" placeholder="Nome da coluna (ex.: Motivo)">
+                    <label class="row small" style="cursor:pointer"><input type="checkbox" ${c.required !== false ? 'checked' : ''} data-tf="fields.${i}.columns.${j}.required" data-tf-type="bool"> Obrigatória</label>
+                    <button type="button" class="icon-btn" data-act="tpl-move-col" data-i="${i}" data-j="${j}" data-dir="-1" title="Mover para a esquerda" ${j === 0 ? 'disabled' : ''}>${icon('up', 14)}</button>
+                    <button type="button" class="icon-btn" data-act="tpl-move-col" data-i="${i}" data-j="${j}" data-dir="1" title="Mover para a direita" ${j === f.columns.length - 1 ? 'disabled' : ''}>${icon('down', 14)}</button>
+                    <button type="button" class="icon-btn" data-act="tpl-del-col" data-i="${i}" data-j="${j}" title="Remover coluna">${icon('trash', 14)}</button>
+                  </div>
+                  <textarea class="textarea" rows="4" style="margin-top:6px;min-height:80px" data-tf="fields.${i}.columns.${j}.options_text" placeholder="Uma opção por linha">${esc(c.options_text ?? (c.options || []).join('\n'))}</textarea>
+                </div>`).join('')}
+              <button type="button" class="btn sm" data-act="tpl-add-col" data-i="${i}">${icon('plus', 14)} Adicionar coluna</button>` : ''}`; })() : ''}
           <div class="row wrap" style="gap:16px;margin-bottom:${choice ? 10 : 0}px">
             <label class="row small" style="cursor:pointer"><input type="checkbox" ${f.required ? 'checked' : ''} data-tf="fields.${i}.required" data-tf-type="bool"> Obrigatória</label>
             ${choice ? `<label class="row small" style="cursor:pointer"><input type="checkbox" ${f.allow_other ? 'checked' : ''} data-tf="fields.${i}.allow_other" data-tf-type="bool"> Incluir "Outros" com campo aberto</label>` : ''}
@@ -2169,6 +2549,19 @@
     const fields = t.fields.map((f) => {
       const out = { key: f.key, label: f.label.trim(), type: f.type, required: !!f.required };
       if (f.help && f.help.trim()) out.help = f.help.trim();
+      if (CATALOG_TYPES(f.type)) {
+        out.catalog = f.catalog || '';
+        out.group_filter = !!f.group_filter;
+        if (f.type === 'items') {
+          out.qty_label = (f.qty_label || '').trim() || 'Quantidade';
+          const used = new Set();
+          out.columns = (f.columns || []).filter((c) => (c.label || '').trim()).map((c) => {
+            const key = c.key || slugKey(c.label, used); used.add(key);
+            const options = (c.options_text != null ? String(c.options_text).split('\n') : (c.options || [])).map((o) => o.trim()).filter(Boolean);
+            return { key, label: c.label.trim(), required: c.required !== false, options: [...new Set(options)] };
+          });
+        }
+      }
       if (CHOICE(f.type)) {
         out.options = (f.options || []).filter((o) => o.label && o.label.trim()).map((o) => {
           const x = { label: o.label.trim() };
@@ -2192,6 +2585,8 @@
     if (!t.fields.length) return 'Adicione pelo menos uma pergunta.';
     for (const [i, f] of t.fields.entries()) {
       if (!f.label) return `A pergunta ${i + 1} está sem texto.`;
+      if (CATALOG_TYPES(f.type) && !f.catalog) return `Escolha o cadastro usado na pergunta "${f.label}".`;
+      for (const c of f.columns || []) if (!c.options.length) return `A coluna "${c.label}" da pergunta "${f.label}" precisa de pelo menos uma opção.`;
       if (CHOICE(f.type) && !f.options.length) return `A pergunta "${f.label}" precisa de pelo menos uma opção.`;
       if (CHOICE(f.type) && new Set(f.options.map((o) => o.label)).size !== f.options.length) return `A pergunta "${f.label}" tem opções repetidas.`;
     }
@@ -2308,11 +2703,46 @@
         ${tpls.map((t) => `<button class="opt" data-act="use-template" data-id="${t.id}" data-list="${el.dataset.list}">${icon('form')}<span style="flex:1"><b>${esc(t.name)}</b>${t.description ? `<div class="small muted">${esc(t.description)}</div>` : ''}</span></button>`).join('')}`);
     },
     'add-card-plain': (el) => { closePopover(); S.addingCardTo = el.dataset.list; renderBoard(); },
-    'use-template': (el) => { const t = (S.templates || []).find((x) => x.id === el.dataset.id); closePopover(); if (t) openTemplateForm(t, { mode: 'new', listId: el.dataset.list }); },
+    'use-template': async (el) => { const t = (S.templates || []).find((x) => x.id === el.dataset.id); closePopover(); if (t) await openTemplateForm(t, { mode: 'new', listId: el.dataset.list }); },
     'close-tplform': () => closeTemplateForm(),
+    'combo-pick': (el) => { const input = $('.combo-input', el.closest('.combo')); if (input && input._results) pickCatalogItem(input, input._results[Number(el.dataset.j)]); },
+    'cat-clear': (el) => { S.tplForm.cat[el.dataset.key].value = null; rerenderCatField(el.dataset.key, 'combo'); },
+    'item-add': (el) => {
+      const st = S.tplForm.cat[el.dataset.key];
+      if (!st.value.length || st.value[st.value.length - 1].key) st.value.push({ key: '', qty: 1, cols: {} });
+      rerenderCatField(el.dataset.key); const box = $(`.cat-field[data-key="${el.dataset.key}"]`); const ins = $$('.combo-input', box); if (ins.length) ins[ins.length - 1].focus();
+    },
+    'item-del': (el) => {
+      const st = S.tplForm.cat[el.dataset.key];
+      st.value.splice(Number(el.dataset.i), 1);
+      if (!st.value.length || st.value[st.value.length - 1].key) st.value.push({ key: '', qty: 1, cols: {} });
+      rerenderCatField(el.dataset.key);
+    },
     'edit-answers': () => {
       const t = (S.templates || []).find((x) => x.id === S.cd.card.template_id);
-      if (t) openTemplateForm(t, { mode: 'edit', card: S.cd.card });
+      if (t) return openTemplateForm(t, { mode: 'edit', card: S.cd.card });
+    },
+    'cat-new': () => { S.catEdit = { name: '', source_url: '', key_column: '', label_columns: [], group_column: '', group_label: '' }; renderCatEditor(); },
+    'cat-edit': (el) => {
+      const c = S.admin.catalogs.find((x) => x.id === el.dataset.id);
+      S.catEdit = JSON.parse(JSON.stringify(c));
+      renderCatEditor();
+      return catPreview();
+    },
+    'cat-preview': () => catPreview(),
+    'cat-cancel': () => { S.catEdit = null; closeModal(); },
+    'cat-sync': async (el) => {
+      el.disabled = true; const old = el.textContent; el.textContent = 'Sincronizando...';
+      try { await catSync(el.dataset.id); } finally { await showAdmin(); }
+      el.textContent = old;
+    },
+    'cat-del': async (el) => {
+      const c = S.admin.catalogs.find((x) => x.id === el.dataset.id);
+      const used = (S.admin.templates || []).filter((t) => t.fields.some((f) => f.catalog === c.id)).map((t) => t.name);
+      if (!(await confirmDialog(`Excluir o cadastro <b>${esc(c.name)}</b>? Os cartões já criados mantêm as respostas.${used.length ? `<br><br><b>Atenção:</b> os templates ${esc(used.join(', '))} usam este cadastro e deixarão de funcionar até serem ajustados.` : ''}`, { confirmText: 'Excluir', danger: true }))) return;
+      await q(sb.from('catalogs').delete().eq('id', c.id));
+      toast('Cadastro excluído.');
+      await showAdmin();
     },
     'tpl-new': () => { S.tplEdit = { name: '', description: '', title_pattern: '', fields: [blankField()], all_boards: false, boards: [], active: true }; renderTplEditor(); },
     'tpl-edit': (el) => { const t = S.admin.templates.find((x) => x.id === el.dataset.id); S.tplEdit = JSON.parse(JSON.stringify(t)); renderTplEditor(); },
@@ -2343,6 +2773,16 @@
       if (j < 0 || j >= F.length) return;
       [F[i], F[j]] = [F[j], F[i]]; renderTplEditor();
     },
+    'tpl-add-col': (el) => { const f = S.tplEdit.fields[Number(el.dataset.i)]; f.columns = f.columns || []; f.columns.push({ label: '', required: true, options_text: '' }); renderTplEditor(); },
+    'tpl-del-col': async (el) => {
+      const f = S.tplEdit.fields[Number(el.dataset.i)]; const c = f.columns[Number(el.dataset.j)];
+      if (c.label && !(await confirmDialog(`Remover a coluna <b>${esc(c.label)}</b>?`, { confirmText: 'Remover', danger: true }))) return;
+      f.columns.splice(Number(el.dataset.j), 1); renderTplEditor();
+    },
+    'tpl-move-col': (el) => {
+      const C = S.tplEdit.fields[Number(el.dataset.i)].columns; const j = Number(el.dataset.j), k = j + Number(el.dataset.dir);
+      if (k < 0 || k >= C.length) return; [C[j], C[k]] = [C[k], C[j]]; renderTplEditor();
+    },
     'tpl-add-opt': (el) => { S.tplEdit.fields[Number(el.dataset.i)].options.push({ label: '' }); renderTplEditor(); },
     'tpl-move-opt': (el) => {
       const O = S.tplEdit.fields[Number(el.dataset.i)].options;
@@ -2355,7 +2795,8 @@
     'tpl-preview': () => {
       const t = cleanTemplate(JSON.parse(JSON.stringify(S.tplEdit)));
       if (!t.fields.length) return toast('Adicione pelo menos uma pergunta.', true);
-      openTemplateForm(t, { mode: 'preview' });
+      if (S.admin && S.admin.catalogs) S.catalogs = S.admin.catalogs;
+      return openTemplateForm(t, { mode: 'preview' });
     },
     'cancel-add-card': () => { S.addingCardTo = null; renderBoard(); },
     'add-list': () => { S.addingList = true; renderBoard(); },
@@ -2860,6 +3301,26 @@
       await refreshBoard();
       if (cardId) go(`#/b/${S.board.id}/c/${cardId}`);
     },
+    'cat-save': async () => {
+      const c = S.catEdit;
+      const label_columns = (c.label_columns || []).filter(Boolean);
+      if (!c.name.trim() || !c.source_url.trim()) return toast('Informe o nome e o link da planilha.', true);
+      if (!c.key_column) return toast('Escolha a coluna com o identificador único.', true);
+      if (!label_columns.length) return toast('Escolha pelo menos uma coluna para o texto exibido.', true);
+      const row = { name: c.name.trim(), source_url: c.source_url.trim(), key_column: c.key_column, label_columns,
+        group_column: c.group_column || null, group_label: c.group_column ? (c.group_label || '').trim() || c.group_column : null };
+      let id = c.id;
+      if (id) await q(sb.from('catalogs').update(row).eq('id', id));
+      else {
+        id = slugKey(c.name, new Set((S.admin.catalogs || []).map((x) => x.id))).slice(0, 40);
+        if (id.length < 2) id = 'cadastro_' + id;
+        await q(sb.from('catalogs').insert({ id, ...row }));
+      }
+      S.catEdit = null;
+      closeModal();
+      toast('Cadastro salvo. Sincronizando...');
+      try { await catSync(id); } finally { await showAdmin(); }
+    },
     'tpl-save': async () => {
       const t = cleanTemplate(JSON.parse(JSON.stringify(S.tplEdit)));
       const problem = templateProblem(t);
@@ -3050,6 +3511,7 @@
 
   document.addEventListener('keydown', (ev) => {
     const el = ev.target;
+    if (S.tplForm && handleCatalogKeys(ev)) return;
     if (ev.key === 'Enter' && !ev.shiftKey && el.hasAttribute && el.hasAttribute('data-enter-submit')) {
       ev.preventDefault(); el.closest('form').requestSubmit(); return;
     }
