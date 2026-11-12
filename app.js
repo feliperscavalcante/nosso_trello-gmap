@@ -1759,14 +1759,20 @@
       </tbody></table></div>`;
   }
 
+  const AUDIT_RECENT = 5;
   function renderAudit() {
     const list = S.admin.audit;
     if (list === null) return '';
     return `
       <section class="panel" style="margin-bottom:20px">
         <h2>${icon('history')} Histórico de administração</h2>
-        ${list.length ? list.map(auditLine).join('') : '<p class="empty">Nenhuma ação registrada ainda.</p>'}
-        ${list.length >= S.admin.auditLimit ? '<button class="btn block" style="justify-content:center" data-act="more-audit">Carregar mais</button>' : ''}
+        ${list.length ? list.slice(0, AUDIT_RECENT).map(auditLine).join('') : '<p class="empty">Nenhuma ação registrada ainda.</p>'}
+        ${list.length > AUDIT_RECENT ? `
+          <div class="audit-older ${S.auditOpen ? 'open' : ''}">
+            ${S.auditOpen ? `<div class="audit-scroll">${list.slice(AUDIT_RECENT).map(auditLine).join('')}
+              ${list.length >= S.admin.auditLimit ? '<button class="btn block" style="justify-content:center;margin-top:6px" data-act="more-audit">Carregar mais antigas</button>' : '<p class="small muted" style="text-align:center;margin:8px 0 0">Início do histórico.</p>'}</div>` : ''}
+            <button class="btn block audit-toggle" data-act="toggle-audit">${icon(S.auditOpen ? 'up' : 'down', 14)} ${S.auditOpen ? 'Ocultar ações antigas' : `Mostrar ações antigas${list.length >= S.admin.auditLimit ? '' : ` (${list.length - AUDIT_RECENT})`}`}</button>
+          </div>` : ''}
       </section>`;
   }
 
@@ -2086,14 +2092,15 @@
   async function maybeSyncCatalogs() {
     if (S.catAutoSynced) return;
     S.catAutoSynced = true;
-    try {
+    S.catAutoPromise = (async () => {
       const cats = await loadCatalogs();
       const limit = Date.now() - 12 * 3600 * 1000;
       if (cats.some((c) => !c.last_sync_at || new Date(c.last_sync_at).getTime() < limit)) {
         await sb.functions.invoke('sync-catalogs', { body: { action: 'sync' } });
         await loadCatalogs();
       }
-    } catch (e) { /* a sincronização automática é silenciosa */ }
+    })().catch(() => { /* a sincronização automática é silenciosa */ });
+    await S.catAutoPromise;
   }
 
   function initCatState(tpl, a) {
@@ -2373,10 +2380,15 @@
     } finally { c.loading = false; if (S.catEdit) renderCatEditor(); }
   }
   async function catSync(id) {
-    const r = await invokeAdmin(id ? { action: 'sync', catalog_id: id } : { action: 'sync' }, 'sync-catalogs');
-    (r.results || []).forEach((x) => toast(`${x.name}: ${x.message}`, !x.ok, 9000));
-    S.catGroups = {};
-    await loadCatalogs();
+    if (S.catSyncBusy) return toast('A sincronização já está em andamento.');
+    S.catSyncBusy = true;
+    try {
+      if (S.catAutoPromise) await S.catAutoPromise; // espera a sincronização automática, para não rodar duas vezes
+      const r = await invokeAdmin(id ? { action: 'sync', catalog_id: id } : { action: 'sync' }, 'sync-catalogs');
+      (r.results || []).forEach((x) => toast(`${x.name}: ${x.message}`, !x.ok, 9000));
+      S.catGroups = {};
+      await loadCatalogs();
+    } finally { S.catSyncBusy = false; }
   }
 
   // ---------- Construtor de templates (Administração) ----------
@@ -3032,7 +3044,16 @@
       toast('Pré-cadastro cancelado.');
       await showAdmin();
     },
-    'more-audit': async () => { S.admin.auditLimit += 50; await showAdmin(); },
+    'more-audit': async (el) => {
+      const box = el.closest('.audit-scroll'); const top = box ? box.scrollTop : 0;
+      S.admin.auditLimit += 50; await showAdmin();
+      const nb = document.querySelector('.audit-scroll'); if (nb) nb.scrollTop = top;
+    },
+    'toggle-audit': () => {
+      S.auditOpen = !S.auditOpen;
+      const sec = document.querySelector('.audit-older').closest('section');
+      sec.outerHTML = renderAudit();
+    },
     'user-status': async (el) => {
       const st = el.dataset.status;
       const u = S.profiles[el.dataset.id];

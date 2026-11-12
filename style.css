@@ -409,3 +409,8 @@ a { color: var(--primary); }
 .tpl-col { border: 1px dashed var(--line); border-radius: 8px; padding: 8px; margin-bottom: 8px; background: #fff; }
 .item-meta { display: flex; flex-direction: column; gap: 1px; margin-top: 3px; font-size: 12px; color: var(--ink-3, #5b6472); }
 .item-meta b { font-weight: 600; color: var(--ink-2, #3b4350); }
+
+/* ---------- Histórico de administração recolhível ---------- */
+.audit-older { margin-top: 4px; }
+.audit-scroll { max-height: 420px; overflow-y: auto; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 4px 6px 8px 0; margin-bottom: 8px; }
+.audit-toggle { justify-content: center; }
