@@ -1,4 +1,4 @@
-# Quadros GMAP
+# Kanban GMAP
 
 Sistema de quadros no estilo Kanban (listas e cartões) para organizar as demandas do setor. Funciona no navegador do computador e do celular, sem custo de licença.
 
@@ -49,7 +49,7 @@ supabase/
 ### 1. Criar o banco no Supabase
 
 1. Acesse **supabase.com**, crie uma conta e clique em **New project**.
-2. Dê um nome (ex.: `quadros-gmap`), crie uma senha forte para o banco e guarde-a.
+2. Dê um nome (ex.: `kanban-gmap`), crie uma senha forte para o banco e guarde-a.
 3. Em **Region**, escolha **South America (São Paulo)**.
 4. Aguarde o projeto ficar pronto (1 a 2 minutos).
 
@@ -68,7 +68,7 @@ Em **Authentication**:
 1. **Sign In / Providers > Email**: mantenha o provedor de e-mail ativo.
    - Recomendação: **desative "Confirm email"**. O sistema já exige aprovação do administrador, e o envio de e-mails do plano gratuito do Supabase tem limite baixo por hora, o que pode travar o cadastro de vários colegas no mesmo dia.
 2. **URL Configuration**:
-   - **Site URL**: o endereço que o GitHub Pages vai gerar (passo 5), por exemplo `https://seuusuario.github.io/quadros-gmap/`
+   - **Site URL**: o endereço que o GitHub Pages vai gerar (passo 5), por exemplo `https://seuusuario.github.io/kanban-gmap/`
    - **Redirect URLs**: adicione o mesmo endereço.
    - Isso é necessário para o link de "Esqueci minha senha" funcionar.
 
@@ -82,7 +82,7 @@ Em **Authentication**:
 window.APP_CONFIG = {
   SUPABASE_URL: 'https://abcdefgh.supabase.co',
   SUPABASE_ANON_KEY: 'eyJhbGciOi...',
-  APP_NAME: 'Quadros GMAP',
+  APP_NAME: 'Kanban GMAP',
   ORG_NAME: 'Gerência de Material e Patrimônio | SEDUC-PI'
 };
 ```
@@ -91,7 +91,7 @@ window.APP_CONFIG = {
 
 ### 5. Publicar no GitHub Pages
 
-1. Em **github.com**, crie um repositório (ex.: `quadros-gmap`).
+1. Em **github.com**, crie um repositório (ex.: `kanban-gmap`).
 2. Clique em **Add file > Upload files** e envie `index.html`, `app.js`, `style.css`, `config.js`, `README.md` e a pasta `supabase`.
 3. Em **Settings > Pages**, em **Source** escolha **Deploy from a branch**, branch **main**, pasta **/ (root)** e salve.
 4. Em 1 a 2 minutos o endereço aparece no topo da página de configurações. Confira se é o mesmo informado no passo 3.
