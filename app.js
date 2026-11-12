@@ -1,5 +1,5 @@
 /* ==========================================================================
-   QUADROS GMAP | Aplicação (HTML + JavaScript puro + Supabase)
+   KANBAN GMAP | Aplicação (HTML + JavaScript puro + Supabase)
    ========================================================================== */
 (() => {
   'use strict';
@@ -8,7 +8,7 @@
   // Configuração e cliente
   // ------------------------------------------------------------------------
   const CFG = window.APP_CONFIG || {};
-  const APP_NAME = CFG.APP_NAME || 'Quadros';
+  const APP_NAME = CFG.APP_NAME || 'Kanban GMAP';
   const ORG_NAME = CFG.ORG_NAME || '';
   const configured = !!(CFG.SUPABASE_URL && CFG.SUPABASE_ANON_KEY &&
     !CFG.SUPABASE_URL.includes('SEU-PROJETO') && !CFG.SUPABASE_ANON_KEY.includes('COLE_AQUI'));
